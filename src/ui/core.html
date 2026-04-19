@@ -186,11 +186,13 @@
         align-items: center;
         gap: 2px;
         overflow-x: auto;
+        overflow-y: hidden;
         flex-shrink: 1;
         min-width: 0;
+        scrollbar-width: none;
       }
       .project-tabs::-webkit-scrollbar {
-        height: 0;
+        display: none;
       }
       .project-tab {
         display: flex;
@@ -221,7 +223,7 @@
       .project-tab.active::after {
         content: '';
         position: absolute;
-        bottom: -1px;
+        bottom: 0;
         left: 8px;
         right: 8px;
         height: 2px;
