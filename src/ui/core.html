@@ -15585,14 +15585,13 @@
           };
         }
 
-        function checkDetailDirty() {
-          const saveBtn = $("#detailSave");
-          if (!detailSnapshot) {
-            saveBtn.disabled = true;
-            return;
-          }
+        // Returns true when the detail panel has unsaved field changes compared
+        // to the snapshot captured when the panel was populated. Used to guard
+        // auto-refresh from overwriting the user's pending edits (TRACK-274).
+        function isDetailDirty() {
+          if (!detailSnapshot) return false;
           const current = snapshotDetail();
-          const dirty =
+          return (
             current.title !== detailSnapshot.title ||
             current.description !== detailSnapshot.description ||
             current.priority !== detailSnapshot.priority ||
@@ -15602,8 +15601,12 @@
             current.date_due !== detailSnapshot.date_due ||
             current.link !== detailSnapshot.link ||
             current.space_type !== detailSnapshot.space_type ||
-            current.project_id !== detailSnapshot.project_id;
-          saveBtn.disabled = !dirty;
+            current.project_id !== detailSnapshot.project_id
+          );
+        }
+
+        function checkDetailDirty() {
+          $("#detailSave").disabled = !isDetailDirty();
         }
 
         function populateDetail(item) {
@@ -18754,10 +18757,13 @@
             if (currentProjectId && !isAttentionView && !isTodayDashboardView) {
               await loadTracker(true);
             }
-            // If detail panel is open, refresh it too
+            // If detail panel is open, refresh it too — but skip when the user
+            // has unsaved field edits so the auto-refresh doesn't overwrite
+            // dirty form values such as an in-progress description (TRACK-274).
             if (
               detailPanel.classList.contains("open") &&
-              detailItemId
+              detailItemId &&
+              !isDetailDirty()
             ) {
               try {
                 const item = await apiGet(`/items/${detailItemId}`);
