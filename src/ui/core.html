@@ -14165,10 +14165,15 @@
             }
           }
 
-          // Filter to only show items assigned to Martin or unassigned
-          const allItems = allItemsRaw.filter(i =>
-            !i.assignee || i.assignee.toLowerCase() === "martin"
-          );
+          // Filter to only show items assigned to Martin or unassigned.
+          // Also exclude items from the Harmoni project — those are the agent's
+          // own scheduled automations and aren't relevant to the user's today view.
+          const allItems = allItemsRaw.filter(i => {
+            if (i.assignee && i.assignee.toLowerCase() !== "martin") return false;
+            const proj = projectLookup[i.project_id];
+            if (proj && proj.short_name === "HARMONI") return false;
+            return true;
+          });
 
           // Sort helper (priority descending, then most recently updated)
           function sortByPriority(items) {
@@ -14591,10 +14596,15 @@
             }
           }
 
-          // Filter to only show items assigned to Martin or unassigned
-          const allItems = allItemsRaw.filter(i =>
-            !i.assignee || i.assignee.toLowerCase() === "martin"
-          );
+          // Filter to only show items assigned to Martin or unassigned.
+          // Also exclude items from the Harmoni project — those are the agent's
+          // own scheduled automations and aren't relevant to the user's today view.
+          const allItems = allItemsRaw.filter(i => {
+            if (i.assignee && i.assignee.toLowerCase() !== "martin") return false;
+            const proj = projectLookup[i.project_id];
+            if (proj && proj.short_name === "HARMONI") return false;
+            return true;
+          });
 
           // Sort helper (priority descending, then most recently updated)
           function sortByPriority(items) {
