@@ -186,3 +186,7 @@ Owner to confirm:
 4. Resolution on the open questions above (or accept the suggested defaults).
 
 After approval, the next step is a writing-plans-style implementation plan for Phase 1.
+
+## Phase 1 status (2026-05-09)
+
+Phase 1 (server-side event enrichment) shipped without UI changes. The dashboard's `_appendSessionEvent()` switch falls through silently on unknown event kinds (`default: return;` at `src/ui/core.html:11175`), so `edit` and `partial_text` are forwarded over SSE and persisted to the audit transcript without rendering in the live feed. Phase 2 will add the part-registry renderer.

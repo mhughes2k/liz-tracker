@@ -100,7 +100,7 @@ describe("mapSdkMessage — result success", () => {
       session_id: fakeSessionId,
     };
 
-    const events = mapSdkMessage(msg, 15, 5);
+    const events = mapSdkMessage(msg as any, 15, 5);
     expect(events).toHaveLength(1);
     const ev = events[0]!;
     expect(ev.event).toBe("completed");
@@ -134,7 +134,7 @@ describe("mapSdkMessage — result error", () => {
       session_id: fakeSessionId,
     };
 
-    const events = mapSdkMessage(msg);
+    const events = mapSdkMessage(msg as any);
     expect(events).toHaveLength(1);
     const ev = events[0]!;
     expect(ev.event).toBe("error");
@@ -162,7 +162,7 @@ describe("mapSdkMessage — result error", () => {
       session_id: fakeSessionId,
     };
 
-    const events = mapSdkMessage(msg);
+    const events = mapSdkMessage(msg as any);
     expect(events).toHaveLength(1);
     const ev = events[0]!;
     expect(ev.event).toBe("error");
@@ -197,16 +197,16 @@ describe("mapSdkMessage — assistant", () => {
       session_id: fakeSessionId,
     };
 
-    const events = mapSdkMessage(msg);
-    expect(events).toHaveLength(1);
-    const ev = events[0]!;
-    expect(ev.event).toBe("text");
-    if (ev.event === "text") {
-      expect(ev.content).toBe("Hello world\nMore text");
+    const events = mapSdkMessage(msg as any);
+    // text event + tool_use event (TRACK-275 enrichment)
+    const textEv = events.find((e) => e.event === "text");
+    expect(textEv).toBeDefined();
+    if (textEv && textEv.event === "text") {
+      expect(textEv.content).toBe("Hello world\nMore text");
     }
   });
 
-  it("returns empty array for assistant with no text blocks", () => {
+  it("emits a tool_use event (no text) for assistant with no text blocks", () => {
     const msg = {
       type: "assistant" as const,
       message: {
@@ -226,8 +226,111 @@ describe("mapSdkMessage — assistant", () => {
       session_id: fakeSessionId,
     };
 
-    const events = mapSdkMessage(msg);
-    expect(events).toHaveLength(0);
+    const events = mapSdkMessage(msg as any);
+    expect(events.find((e) => e.event === "text")).toBeUndefined();
+    const tu = events.find((e) => e.event === "tool_use");
+    expect(tu).toBeDefined();
+  });
+});
+
+// ── Assistant tool_use blocks → tool_use events with args + call_id ──
+
+describe("mapSdkMessage — assistant tool_use blocks", () => {
+  it("emits a tool_use event for each tool_use content block, with args + call_id", () => {
+    const msg = {
+      type: "assistant" as const,
+      message: {
+        content: [
+          { type: "text" as const, text: "Reading the file" },
+          {
+            type: "tool_use" as const,
+            id: "tu_abc123",
+            name: "Read",
+            input: { file_path: "/tmp/foo.ts" },
+          },
+        ],
+        id: "msg_1",
+        type: "message" as const,
+        role: "assistant" as const,
+        model: "claude-opus-4-7",
+        stop_reason: "tool_use",
+        stop_sequence: null,
+        usage: { input_tokens: 100, output_tokens: 50 },
+      },
+      parent_tool_use_id: null,
+      uuid: fakeUuid,
+      session_id: fakeSessionId,
+    };
+
+    const events = mapSdkMessage(msg as any);
+    // One text event + one tool_use event
+    expect(events).toHaveLength(2);
+    const text = events.find((e) => e.event === "text");
+    const tu = events.find((e) => e.event === "tool_use");
+    expect(text).toBeDefined();
+    expect(tu).toBeDefined();
+    if (tu && tu.event === "tool_use") {
+      expect(tu.tool).toBe("Read");
+      expect(tu.call_id).toBe("tu_abc123");
+      expect(tu.args).toBe('{"file_path":"/tmp/foo.ts"}');
+      expect(tu.file).toBe("/tmp/foo.ts");
+    }
+  });
+
+  it("truncates oversized args", () => {
+    const huge = "x".repeat(20_000);
+    const msg = {
+      type: "assistant" as const,
+      message: {
+        content: [
+          {
+            type: "tool_use" as const,
+            id: "tu_big",
+            name: "Write",
+            input: { file_path: "/tmp/big.txt", content: huge },
+          },
+        ],
+        id: "msg_2",
+        type: "message" as const,
+        role: "assistant" as const,
+        model: "claude-opus-4-7",
+        stop_reason: "tool_use",
+        stop_sequence: null,
+        usage: { input_tokens: 100, output_tokens: 50 },
+      },
+      parent_tool_use_id: null,
+      uuid: fakeUuid,
+      session_id: fakeSessionId,
+    };
+
+    const events = mapSdkMessage(msg as any);
+    const tu = events.find((e) => e.event === "tool_use");
+    if (tu && tu.event === "tool_use") {
+      expect(tu.args!.length).toBeLessThan(10_000);
+      expect(tu.args).toMatch(/\[truncated \d+ bytes\]$/);
+    }
+  });
+
+  it("does not emit a tool_use event when assistant has only text", () => {
+    const msg = {
+      type: "assistant" as const,
+      message: {
+        content: [{ type: "text" as const, text: "just text" }],
+        id: "msg_3",
+        type: "message" as const,
+        role: "assistant" as const,
+        model: "claude-opus-4-7",
+        stop_reason: "end_turn",
+        stop_sequence: null,
+        usage: { input_tokens: 100, output_tokens: 50 },
+      },
+      parent_tool_use_id: null,
+      uuid: fakeUuid,
+      session_id: fakeSessionId,
+    };
+
+    const events = mapSdkMessage(msg as any);
+    expect(events.filter((e) => e.event === "tool_use")).toHaveLength(0);
   });
 });
 
@@ -318,6 +421,43 @@ describe("mapSdkMessage — tool_use_summary", () => {
   });
 });
 
+// ── tool_use_summary preceding_tool_use_ids → call_id on tool_result ──
+
+describe("mapSdkMessage — tool_use_summary call_id correlation", () => {
+  it("propagates the last preceding_tool_use_ids entry as call_id", () => {
+    const msg = {
+      type: "tool_use_summary" as const,
+      summary: "Read(src/index.ts): success",
+      preceding_tool_use_ids: ["tu_abc123"],
+      uuid: fakeUuid,
+      session_id: fakeSessionId,
+    };
+
+    const events = mapSdkMessage(msg);
+    const ev = events[0]!;
+    expect(ev.event).toBe("tool_result");
+    if (ev.event === "tool_result") {
+      expect(ev.call_id).toBe("tu_abc123");
+    }
+  });
+
+  it("omits call_id when preceding_tool_use_ids is empty", () => {
+    const msg = {
+      type: "tool_use_summary" as const,
+      summary: "Read(src/index.ts): success",
+      preceding_tool_use_ids: [],
+      uuid: fakeUuid,
+      session_id: fakeSessionId,
+    };
+
+    const events = mapSdkMessage(msg);
+    const ev = events[0]!;
+    if (ev.event === "tool_result") {
+      expect(ev.call_id).toBeUndefined();
+    }
+  });
+});
+
 // ── Status message → status event ────────────────────────────────────────────
 
 describe("mapSdkMessage — status", () => {
@@ -340,20 +480,61 @@ describe("mapSdkMessage — status", () => {
   });
 });
 
-// ── Unknown message types → empty array ──────────────────────────────────────
+// ── stream_event partial assistant text → partial_text event ──
 
-describe("mapSdkMessage — unknown types", () => {
-  it("returns empty array for unhandled message types", () => {
+describe("mapSdkMessage — stream_event partial text", () => {
+  it("emits a partial_text event for content_block_delta of type text_delta", () => {
     const msg = {
       type: "stream_event" as const,
-      event: {} as any,
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "hel" },
+      },
       parent_tool_use_id: null,
       uuid: fakeUuid,
       session_id: fakeSessionId,
+      message_id: "msg_xyz",
     };
 
     const events = mapSdkMessage(msg as any);
-    expect(events).toHaveLength(0);
+    expect(events).toHaveLength(1);
+    const ev = events[0]!;
+    expect(ev.event).toBe("partial_text");
+    if (ev.event === "partial_text") {
+      expect(ev.delta).toBe("hel");
+      expect(ev.message_id).toBe("msg_xyz");
+    }
+  });
+
+  it("returns empty for non-text_delta stream events", () => {
+    const msg = {
+      type: "stream_event" as const,
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: "{}" },
+      },
+      parent_tool_use_id: null,
+      uuid: fakeUuid,
+      session_id: fakeSessionId,
+      message_id: "msg_xyz",
+    };
+
+    expect(mapSdkMessage(msg as any)).toHaveLength(0);
+  });
+
+  it("returns empty for stream_event with no delta text", () => {
+    const msg = {
+      type: "stream_event" as const,
+      event: { type: "message_start" },
+      parent_tool_use_id: null,
+      uuid: fakeUuid,
+      session_id: fakeSessionId,
+      message_id: "msg_xyz",
+    };
+
+    expect(mapSdkMessage(msg as any)).toHaveLength(0);
   });
 });
 
@@ -478,6 +659,53 @@ describe("runner stdio protocol integration", () => {
     expect(events.some(e => e.event === "completed")).toBe(true);
 
     // Cleanup
+    try { unlinkSync(mockScript); } catch {}
+  });
+
+  it("forwards enriched tool_use, tool_result, edit, and partial_text events", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "runner-test-"));
+    const mockScript = join(tmpDir, "mock-runner-rich.js");
+    writeFileSync(mockScript, `
+      const rl = require('readline').createInterface({ input: process.stdin });
+      rl.once('line', () => {
+        process.stdout.write(JSON.stringify({ event: "started", sessionId: "runner_rich", pid: process.pid }) + "\\n");
+        process.stdout.write(JSON.stringify({ event: "tool_use", tool: "Read", file: "/tmp/x.ts", call_id: "tu_1", args: '{"file_path":"/tmp/x.ts"}' }) + "\\n");
+        process.stdout.write(JSON.stringify({ event: "tool_result", tool: "Read", status: "success", call_id: "tu_1", output: "file contents" }) + "\\n");
+        process.stdout.write(JSON.stringify({ event: "edit", path: "/tmp/x.ts", change_type: "edit", diff: "--- a/x.ts\\n+++ b/x.ts\\n@@ -1 +1 @@\\n-old\\n+new", call_id: "tu_2" }) + "\\n");
+        process.stdout.write(JSON.stringify({ event: "partial_text", delta: "Hel", message_id: "msg_a" }) + "\\n");
+        process.stdout.write(JSON.stringify({ event: "partial_text", delta: "lo", message_id: "msg_a" }) + "\\n");
+        process.stdout.write(JSON.stringify({ event: "completed", result: "success", duration: 1, turns: 1, cost: 0.01 }) + "\\n");
+        process.exit(0);
+      });
+    `);
+
+    const child = spawn(process.execPath, [mockScript], { stdio: ["pipe", "pipe", "pipe"] });
+    const events: any[] = [];
+    const rl = createInterface({ input: child.stdout!, crlfDelay: Infinity });
+
+    const done = new Promise<void>((resolve, reject) => {
+      rl.on("line", (line) => { try { events.push(JSON.parse(line)); } catch {} });
+      child.on("exit", () => resolve());
+      setTimeout(() => reject(new Error("Timeout")), 5000);
+    });
+
+    child.stdin!.write(JSON.stringify({
+      event: "config", itemKey: "TEST-RICH", prompt: "x", systemPromptAppend: "",
+      cwd: "/tmp", model: "sonnet", maxTurns: 1, promptType: "coder", attachments: [],
+    }) + "\n");
+
+    await done;
+    rl.close();
+
+    expect(events).toHaveLength(7);
+    expect(events[1]).toMatchObject({ event: "tool_use", tool: "Read", call_id: "tu_1" });
+    expect(events[1].args).toContain("file_path");
+    expect(events[2]).toMatchObject({ event: "tool_result", call_id: "tu_1", output: "file contents" });
+    expect(events[3]).toMatchObject({ event: "edit", path: "/tmp/x.ts", change_type: "edit" });
+    expect(events[3].diff).toContain("---");
+    expect(events[4]).toMatchObject({ event: "partial_text", delta: "Hel", message_id: "msg_a" });
+    expect(events[5]).toMatchObject({ event: "partial_text", delta: "lo", message_id: "msg_a" });
+
     try { unlinkSync(mockScript); } catch {}
   });
 });

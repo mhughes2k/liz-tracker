@@ -2213,6 +2213,19 @@ async function _dispatchViaRunnerImpl(
         case "heartbeat":
           logger.debug({ itemId: item.id, sessionId, elapsed: evt.elapsed, turns: evt.turns }, "Runner heartbeat");
           break;
+
+        case "edit":
+          // Phase 1 (TRACK-275): events are forwarded to SSE/audit. The dashboard
+          // renderer is added in Phase 2; for now, just log at debug level.
+          logger.debug(
+            { itemId: item.id, sessionId, path: evt.path, change_type: evt.change_type, diffBytes: evt.diff.length },
+            "Runner edit event",
+          );
+          break;
+
+        case "partial_text":
+          // Phase 1 (TRACK-275): forwarded only — keep noise low.
+          break;
       }
     });
 

@@ -12,6 +12,7 @@
 
 import { randomBytes } from "crypto";
 import { createInterface } from "readline";
+import { readFile } from "fs/promises";
 import type {
   RunnerConfig,
   RunnerEvent,
@@ -24,7 +25,15 @@ import type {
   RunnerTextEvent,
   RunnerStatusEvent,
   RunnerHeartbeatEvent,
+  RunnerEditEvent,
+  RunnerPartialTextEvent,
 } from "./runner-types.js";
+import {
+  summarizeArgs,
+  truncateOutput,
+  computeUnifiedDiff,
+  MAX_OUTPUT_BYTES,
+} from "./runner-output.js";
 import type {
   SDKMessage,
   SDKSystemMessage,
@@ -78,15 +87,40 @@ export function mapSdkMessage(
 
     case "assistant": {
       const assistMsg = msg as SDKAssistantMessage;
-      const textBlocks = (assistMsg.message.content as any[])
+      const blocks = assistMsg.message.content as any[];
+      const out: RunnerEvent[] = [];
+
+      const textBlocks = blocks
         .filter((b: any) => b.type === "text")
         .map((b: any) => b.text as string);
-      if (textBlocks.length === 0) return [];
-      const ev: RunnerTextEvent = {
-        event: "text",
-        content: textBlocks.join("\n"),
-      };
-      return [ev];
+      if (textBlocks.length > 0) {
+        const ev: RunnerTextEvent = {
+          event: "text",
+          content: textBlocks.join("\n"),
+        };
+        out.push(ev);
+      }
+
+      for (const b of blocks) {
+        if (b.type !== "tool_use") continue;
+        const input = (b.input ?? {}) as Record<string, unknown>;
+        const file =
+          typeof input.file_path === "string"
+            ? (input.file_path as string)
+            : typeof input.path === "string"
+            ? (input.path as string)
+            : undefined;
+        const ev: RunnerToolUseEvent = {
+          event: "tool_use",
+          tool: b.name as string,
+          ...(file ? { file } : {}),
+          call_id: b.id as string,
+          args: summarizeArgs(input),
+        };
+        out.push(ev);
+      }
+
+      return out;
     }
 
     case "tool_progress": {
@@ -102,11 +136,14 @@ export function mapSdkMessage(
     case "tool_use_summary": {
       const tusMsg = msg as SDKToolUseSummaryMessage;
       const parsed = parseToolSummary(tusMsg.summary);
+      const ids = tusMsg.preceding_tool_use_ids ?? [];
+      const callId = ids.length > 0 ? ids[ids.length - 1] : undefined;
       const ev: RunnerToolResultEvent = {
         event: "tool_result",
         tool: parsed.tool,
         status: parsed.status,
         ...(parsed.error ? { error: parsed.error } : {}),
+        ...(callId ? { call_id: callId } : {}),
       };
       return [ev];
     }
@@ -131,6 +168,25 @@ export function mapSdkMessage(
         recoverable: false,
       };
       return [ev];
+    }
+
+    case "stream_event": {
+      const sevMsg = msg as unknown as { event: any; message_id?: string };
+      const inner = sevMsg.event;
+      if (
+        inner?.type === "content_block_delta" &&
+        inner?.delta?.type === "text_delta" &&
+        typeof inner.delta.text === "string" &&
+        inner.delta.text.length > 0
+      ) {
+        const ev: RunnerPartialTextEvent = {
+          event: "partial_text",
+          delta: inner.delta.text,
+          message_id: sevMsg.message_id ?? "",
+        };
+        return [ev];
+      }
+      return [];
     }
 
     default:
@@ -275,6 +331,111 @@ export async function main(): Promise<void> {
     }
   });
 
+  // ── PreToolUse / PostToolUse hooks (TRACK-275 Phase 1) ──────────────────
+  // PreToolUse snapshots the file contents before file-mutating tools run,
+  // so PostToolUse can compute a unified diff and emit an `edit` event.
+  // PostToolUse also emits a `tool_result` event with the full output text
+  // (separate from the SDK's tool_use_summary message which only carries
+  // success/error status). Both events share the same call_id so a future
+  // dashboard renderer can merge them.
+  const editPreSnapshots = new Map<string, { path: string; before: string }>();
+  const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit"]);
+
+  const preToolUseHook = async (input: any): Promise<any> => {
+    try {
+      const toolName = String(input.tool_name ?? "");
+      if (!EDIT_TOOLS.has(toolName)) return { continue: true };
+      const callId = typeof input.tool_use_id === "string" ? input.tool_use_id : undefined;
+      if (!callId) return { continue: true };
+      const filePath =
+        typeof input.tool_input?.file_path === "string"
+          ? (input.tool_input.file_path as string)
+          : undefined;
+      if (!filePath) return { continue: true };
+      let before = "";
+      try {
+        before = await readFile(filePath, "utf8");
+      } catch {
+        // File doesn't exist yet (Write tool creating a new file) — treat as empty.
+        before = "";
+      }
+      editPreSnapshots.set(callId, { path: filePath, before });
+    } catch (err) {
+      process.stderr.write(`[session-runner] PreToolUse hook error: ${err}\n`);
+    }
+    return { continue: true };
+  };
+
+  const postToolUseHook = async (input: any): Promise<any> => {
+    try {
+      const toolName = String(input.tool_name ?? "unknown");
+      const callId = typeof input.tool_use_id === "string" ? input.tool_use_id : undefined;
+      const response = input.tool_response;
+      const outputStr =
+        typeof response === "string" ? response : JSON.stringify(response ?? "");
+      const ev: RunnerToolResultEvent = {
+        event: "tool_result",
+        tool: toolName,
+        status: "success",
+        ...(callId ? { call_id: callId } : {}),
+        output: truncateOutput(outputStr, MAX_OUTPUT_BYTES),
+      };
+      emit(ev);
+
+      if (callId && EDIT_TOOLS.has(toolName)) {
+        const snap = editPreSnapshots.get(callId);
+        editPreSnapshots.delete(callId);
+        if (snap) {
+          let after = "";
+          try {
+            after = await readFile(snap.path, "utf8");
+          } catch {
+            after = "";
+          }
+          const diff = computeUnifiedDiff(snap.path, snap.before, after);
+          const editEv: RunnerEditEvent = {
+            event: "edit",
+            path: snap.path,
+            change_type:
+              toolName === "Write"
+                ? "write"
+                : toolName === "MultiEdit"
+                ? "multi_edit"
+                : "edit",
+            diff,
+            call_id: callId,
+          };
+          emit(editEv);
+        }
+      }
+    } catch (err) {
+      process.stderr.write(`[session-runner] PostToolUse hook error: ${err}\n`);
+    }
+    return { continue: true };
+  };
+
+  const postToolUseFailureHook = async (input: any): Promise<any> => {
+    try {
+      const toolName = String(input.tool_name ?? "unknown");
+      const callId = typeof input.tool_use_id === "string" ? input.tool_use_id : undefined;
+      const errMsg = String(input.error ?? "Tool execution failed");
+      const ev: RunnerToolResultEvent = {
+        event: "tool_result",
+        tool: toolName,
+        status: "error",
+        error: errMsg,
+        ...(callId ? { call_id: callId } : {}),
+        output: truncateOutput(errMsg, MAX_OUTPUT_BYTES),
+      };
+      emit(ev);
+      // Drop any stale pre-snapshot for this call_id.
+      if (callId) editPreSnapshots.delete(callId);
+    } catch (err) {
+      process.stderr.write(`[session-runner] PostToolUseFailure hook error: ${err}\n`);
+    }
+    return { continue: true };
+  };
+
   try {
     // Build MCP server config — include tracker MCP if URL provided
     const mcpServers: Record<string, any> = {};
@@ -290,7 +451,7 @@ export async function main(): Promise<void> {
         ...(config.effort ? { effort: config.effort as "low" | "medium" | "high" | "max" } : {}),
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
-        includePartialMessages: false,
+        includePartialMessages: true,
         maxTurns: config.maxTurns,
         persistSession: true,
         systemPrompt: {
@@ -299,6 +460,11 @@ export async function main(): Promise<void> {
           append: config.systemPromptAppend,
         },
         abortController,
+        hooks: {
+          PreToolUse: [{ hooks: [preToolUseHook] }],
+          PostToolUse: [{ hooks: [postToolUseHook] }],
+          PostToolUseFailure: [{ hooks: [postToolUseFailureHook] }],
+        } as any,
         ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
       },
     });

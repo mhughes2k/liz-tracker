@@ -247,7 +247,18 @@ When `DISPATCH_MODE=runner`:
 
 **Runner stdio protocol:**
 - Orchestrator → Runner (stdin): config JSON, steer messages, abort signal
-- Runner → Orchestrator (stdout): JSON-line events (started, tool_use, text, completed, error, heartbeat)
+- Runner → Orchestrator (stdout): JSON-line events. Event kinds:
+  - `started` — session start, with `sessionId`, `pid`, `apiKeySource`
+  - `tool_use` — tool invocation with `tool`, `call_id`, `args` (JSON-stringified, ≤8KB), optional `file`
+  - `tool_result` — tool completion paired by `call_id`, with `status`, optional `error`, optional `output` (≤64KB)
+  - `edit` — file mutation from `Edit`/`Write`/`MultiEdit`, with `path`, `change_type`, `diff` (unified diff, ≤64KB), `call_id`
+  - `text` — full assistant message text (one event per assistant turn)
+  - `partial_text` — token-by-token text delta with `message_id` and `delta` (paired with the eventual `text` event)
+  - `status` — SDK status updates (compacting, etc.)
+  - `heartbeat` — every 30s with `elapsed`, `turns`
+  - `completed` — session result with `duration`, `turns`, `cost`
+  - `error` — runner error with `message`, `recoverable`
+- Truncation constants live in `src/runner-output.ts` (`MAX_OUTPUT_BYTES=64KB`, `MAX_ARGS_BYTES=8KB`)
 
 ### Security (auto-execution hardening)
 
