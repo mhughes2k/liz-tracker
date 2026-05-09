@@ -28,6 +28,7 @@ Standalone project management tracker with kanban UI, REST API, MCP tools, and O
 | `scripts/build-ui.js` | UI pre-compilation script — concatenates core.html + space plugins into index.html |
 | `src/session-runner.ts` | Session runner — Agent SDK execution, stdio JSON protocol |
 | `src/runner-types.ts` | Shared types for runner events and config |
+| `src/runner-output.ts` | Pure helpers for runner output truncation, arg summarization, and unified-diff computation |
 | `scripts/safe-restart.sh` | Safe restart script — checks for active sessions before restarting |
 | `scripts/safe-upgrade-opencode.sh` | Safely upgrade OpenCode without interrupting active sessions |
 | `.claude/commands/` | Slash commands for Claude Code sessions: `/verify`, `/code-review`, `/build-fix` |
@@ -84,7 +85,8 @@ npm run test:coverage # Run tests with coverage report
 **Current test coverage:**
 - `src/db.test.ts` — actor classification, state transitions (incl. security rules), project/item CRUD, locks, dependencies, comments, comment reactions (toggle, uniqueness, aggregation, batch, cascade delete, activity logging), approval provenance, move between projects, activity log (logActivity/listActivity, filtering, integration with mutations), settings CRUD (getSetting/setSetting/getAllSettings)
 - `src/orchestrator.test.ts` — PID-based stale session detection, agent config validation, URL helpers (base64url encoding, session/directory/API URL builders), error classification (413 errors, image-too-large, post-completion errors), scheduled task time gating (isScheduleTimeDue frequency/timezone/last_run logic), per-task model resolution (resolveModelForItem strength tiers, DB-backed setting overrides)
-- `src/session-runner.test.ts` — SDK message mapping, stdio protocol integration tests (event flow, steering)
+- `src/session-runner.test.ts` — SDK message mapping, stdio protocol integration tests (event flow, steering, tool_use/tool_result/edit/partial_text events)
+- `src/runner-output.test.ts` — runner output helpers (truncateOutput, summarizeArgs, computeUnifiedDiff)
 - `src/spaces/travel.test.ts` — type-aware segment deduplication key logic (flight/lodging/transport disambiguation)
 - `src/spaces/scheduled.test.ts` — scheduled space data sanitization (malformed `days_of_week` normalization, numeric-to-name coercion, invalid entry dropping)
 
