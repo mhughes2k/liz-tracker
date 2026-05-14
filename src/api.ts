@@ -67,6 +67,11 @@ import {
   listLinks,
   VALID_LINK_RELATIONS,
   type LinkRelation,
+  getChildItems,
+  getParentItem,
+  getChildCountsBatch,
+  reorderChildren,
+  createGroupFromItems,
   createComment,
   listComments,
   getCommentCounts,
@@ -568,6 +573,9 @@ async function handleApiRequest(
         if (!project) return error(res, "Project not found", 404);
         const items = listWorkItems({ project_id: projectId });
         const commentCounts = getCommentCounts(items.map((i) => i.id));
+        // TRACK-281: batch fetch child counts so kanban cards can render
+        // "12/15 done" progress rollups without per-card requests.
+        const childCounts = getChildCountsBatch(items.map((i) => i.id));
         const enriched = items.map((i) => {
           const key = `${project.short_name}-${i.seq_number}`;
           return {
@@ -575,6 +583,7 @@ async function handleApiRequest(
             key,
             url: buildItemUrl(key),
             comment_count: commentCounts[i.id] || 0,
+            child_counts: childCounts.get(i.id) || null,
           };
         });
         const tracker: Record<string, typeof enriched> = {};
@@ -737,7 +746,55 @@ async function handleApiRequest(
     // ── Work Items (direct access) ──
     if (parts[0] === "items") {
       const itemId =
-        parts[1] === "clear-stale-locks" || parts[1] === "recent" || parts[1] === "ai-categorize" || parts[1] === "ai-session-summary" ? parts[1] : resolveItemId(parts[1]);
+        parts[1] === "clear-stale-locks" || parts[1] === "recent" || parts[1] === "ai-categorize" || parts[1] === "ai-session-summary" || parts[1] === "group" ? parts[1] : resolveItemId(parts[1]);
+
+      // TRACK-281: POST /items/group — create a new parent item linked via
+      // parent_of to the given child items. Used by the multi-select
+      // "Group as new item" action in the kanban.
+      if (parts.length === 2 && parts[1] === "group" && method === "POST") {
+        const body = await parseBody(req);
+        const title = body.title ? String(body.title).trim() : "";
+        if (!title) return error(res, "title is required");
+        const rawIds = Array.isArray(body.child_item_ids)
+          ? body.child_item_ids
+          : null;
+        if (!rawIds || rawIds.length < 2) {
+          return error(res, "child_item_ids must contain at least 2 entries");
+        }
+        // Resolve display keys to internal IDs (consistent with addLink behaviour).
+        const childIds: string[] = [];
+        for (const raw of rawIds) {
+          const s = String(raw);
+          const byKey = getWorkItemByKey(s);
+          childIds.push(byKey ? byKey.id : s);
+        }
+        const actor = body.actor ? String(body.actor) : "dashboard";
+        try {
+          const parent = createGroupFromItems({
+            title,
+            description: body.description ? String(body.description) : "",
+            child_item_ids: childIds,
+            target_project_id: body.target_project_id
+              ? String(body.target_project_id)
+              : undefined,
+            created_by: actor,
+          });
+          return json(
+            res,
+            {
+              ...parent,
+              key: getWorkItemKey(parent),
+              url: buildItemUrl(getWorkItemKey(parent)),
+            },
+            201,
+          );
+        } catch (e) {
+          return error(
+            res,
+            e instanceof Error ? e.message : "Failed to create group",
+          );
+        }
+      }
 
       // POST /items/clear-stale-locks (note: before :id routes)
       if (
@@ -1179,6 +1236,51 @@ Extract the structured fields from this description. Return ONLY valid JSON.`;
         const ok = removeLinkById(linkId, actor);
         if (!ok) return error(res, "Link not found", 404);
         return json(res, { deleted: true });
+      }
+
+      // TRACK-281: GET /items/:id/children — hydrated children list for the
+      // Children panel + parent badge.
+      if (
+        parts.length === 3 &&
+        parts[2] === "children" &&
+        method === "GET"
+      ) {
+        const children = getChildItems(itemId);
+        const hydrated = children.map((c) => {
+          const proj = getProject(c.project_id);
+          return {
+            ...c,
+            key: getWorkItemKey(c),
+            project_short_name: proj?.short_name || null,
+            project_theme: proj?.theme || null,
+          };
+        });
+        const parent = getParentItem(itemId);
+        const parentHydrated = parent
+          ? {
+              id: parent.id,
+              key: getWorkItemKey(parent),
+              title: parent.title,
+              state: parent.state,
+              project_id: parent.project_id,
+            }
+          : null;
+        return json(res, { children: hydrated, parent: parentHydrated });
+      }
+
+      // TRACK-281: PATCH /items/:id/children/reorder — write drag positions
+      if (
+        parts.length === 4 &&
+        parts[2] === "children" &&
+        parts[3] === "reorder" &&
+        method === "PATCH"
+      ) {
+        const body = await parseBody(req);
+        const ids = Array.isArray(body.child_ids) ? body.child_ids.map(String) : null;
+        if (!ids) return error(res, "child_ids array is required");
+        const actor = body.actor ? String(body.actor) : "dashboard";
+        const changed = reorderChildren(itemId, ids, actor);
+        return json(res, { reordered: changed });
       }
 
       // GET/POST /items/:id/comments

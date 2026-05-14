@@ -766,12 +766,57 @@ Zero changes needed to `api.ts`, `mcp-server.ts`, `db.ts`, or the overlay shell 
 
 ## Conventions
 
-- Database tables are prefixed with `tracker_` (projects, work_items, comments, transitions, watchers, dependencies, attachments, description_versions, activity_log, execution_audits, comment_reactions, settings)
+- Database tables are prefixed with `tracker_` (projects, work_items, comments, transitions, watchers, dependencies, attachments, description_versions, activity_log, execution_audits, comment_reactions, settings, links)
 - All IDs are random hex strings (24 chars)
 - Timestamps are ISO 8601 strings
 - Work items have sequential keys per project (e.g. PROJ-1, PROJ-2)
 - The MCP server runs in stateless mode (new server+transport per request)
 - Orchestrator-spawned sessions use `actor="Coder"` for state changes
+
+### Groups (parent_of typed links)
+
+Groups are **not a first-class entity** — they are regular work items that have `parent_of` links to their member items. This means:
+
+- A group inherits state, comments, AI categorization, search, and audit log for free
+- Groups can contain groups (recursion is free)
+- A group can graduate into a real epic with no data migration
+- Cross-project membership is allowed (a TRACK group can contain LIZ items)
+
+**Schema:**
+- `tracker_links` rows with `relation='parent_of'` represent group membership (from = parent group, to = member)
+- `tracker_links.position INTEGER NULL` orders children within a parent (NULL sorts last, then created_at)
+- `addLink()` auto-assigns the next position for new `parent_of` rows
+- `addLink()` rejects edges that would create a cycle (`wouldCreateParentCycle`); both `parent_of` and `child_of` are checked
+
+**Key DB functions** (in `src/db.ts`):
+
+| Function | Purpose |
+| --- | --- |
+| `wouldCreateParentCycle(parentId, childId)` | DFS down via parent_of to detect cycles; symmetric to child_of |
+| `reorderChildren(parentId, orderedChildIds, actor)` | Set link.position transactionally + log activity |
+| `getChildItems(parentId)` | Hydrate children with `link_id` + `link_position` |
+| `getParentItem(childId)` | Find first parent via inverse parent_of edge |
+| `getChildCountsBatch(parentIds)` | Single GROUP BY query bucketing children into done/in_progress/open |
+| `createGroupFromItems({title, description?, child_item_ids, target_project_id?, created_by})` | Create a parent item and add parent_of links to each child; skips cycle-causing children silently |
+
+**API:**
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/api/v1/items/:id/children` | Returns `{children: [...], parent: {...} \| null}` |
+| `PATCH` | `/api/v1/items/:id/children/reorder` | Body `{child_ids: [...]}` — reorder children |
+| `POST` | `/api/v1/items/group` | Body `{title, child_item_ids, description?, target_project_id?, actor?}` — create a new group |
+
+`GET /projects/:id/tracker` includes `child_counts: { total, done, in_progress, open }` on each item with children (for kanban progress rollups).
+
+**MCP tools:** `tracker_list_children`, `tracker_create_group`.
+
+**UI:**
+- Detail panel shows a "Parent" badge near the title when the item has an incoming `parent_of` link
+- Detail panel shows a "Children" section with stats line + drag-reorder + "+ Add child" when the item has outgoing `parent_of` links
+- Kanban cards with children show a "12/15 done" progress mini-bar
+- Shift-click (or Cmd/Ctrl-click) on kanban cards multi-selects; the floating action bar offers "Group as new item" when 2+ are selected
+- The "Group as new item" modal lets the user set title, description, and target project — the new group is created with the actor recorded as `dashboard`
 
 ## Dashboard UI Code Organization
 

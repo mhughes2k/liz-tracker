@@ -36,6 +36,9 @@ import {
   removeLink,
   listLinks,
   VALID_LINK_RELATIONS,
+  getChildItems,
+  getParentItem,
+  createGroupFromItems,
   createComment,
   listComments,
   toggleReaction,
@@ -777,6 +780,83 @@ function createMcpServer(): McpServer {
         };
       });
       return { content: [{ type: "text", text: JSON.stringify(hydrated, null, 2) }] };
+    },
+  );
+
+  // ── Groups (TRACK-281) ──
+
+  server.tool(
+    "tracker_list_children",
+    "List the parent_of children of a group item, sorted by drag position. Each child is the full work item plus its link's position.",
+    {
+      item_id: z.string().describe("Parent item ID or display key (e.g. \"TRACK-5\")"),
+    },
+    async (args) => {
+      const itemId = resolveId(args.item_id);
+      const children = getChildItems(itemId);
+      const hydrated = children.map((c) => ({
+        ...c,
+        key: getWorkItemKey(c),
+      }));
+      const parent = getParentItem(itemId);
+      const parentHydrated = parent
+        ? { id: parent.id, key: getWorkItemKey(parent), title: parent.title, state: parent.state }
+        : null;
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ children: hydrated, parent: parentHydrated }, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "tracker_create_group",
+    "Create a group: a new parent work item linked to the given child items via parent_of links. The new item lives in the target project (or the first child's project if not specified). At least 2 child items are required. Note: MCP-created items have created_by_class=agent, which limits some downstream operations; for human-actor flows use the dashboard.",
+    {
+      title: z.string().describe("Title for the new group item"),
+      child_item_ids: z
+        .array(z.string())
+        .min(2)
+        .describe("Item IDs or display keys for children. At least 2 required."),
+      description: z.string().optional().describe("Optional description for the group item"),
+      target_project_id: z
+        .string()
+        .optional()
+        .describe("Project to create the group in. Defaults to the first child's project."),
+    },
+    async (args) => {
+      const childIds = args.child_item_ids.map(resolveId);
+      try {
+        const parent = createGroupFromItems({
+          title: args.title,
+          description: args.description,
+          child_item_ids: childIds,
+          target_project_id: args.target_project_id,
+          created_by: "Harmoni",
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { ...parent, key: getWorkItemKey(parent) },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [
+            { type: "text", text: `Error: ${e instanceof Error ? e.message : "Failed"}` },
+          ],
+        };
+      }
     },
   );
 

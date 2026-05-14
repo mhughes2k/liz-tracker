@@ -1499,6 +1499,152 @@
       .related-add-wrapper {
         margin-top: 4px;
       }
+      /* TRACK-281: Children panel + Parent badge + card progress + multi-select */
+      .children-list {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        margin-bottom: 8px;
+      }
+      .children-add-wrapper {
+        margin-top: 6px;
+      }
+      .children-stats {
+        font-size: 0.78rem;
+        color: var(--text-dim);
+        margin-bottom: 6px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .children-stats .stat-pill {
+        padding: 1px 6px;
+        border-radius: 3px;
+        font-size: 0.7rem;
+      }
+      .child-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 8px;
+        background: var(--bg-accent);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        font-size: 0.85rem;
+        cursor: pointer;
+      }
+      .child-row:hover { background: var(--bg); }
+      .child-row .child-drag {
+        cursor: grab;
+        opacity: 0.4;
+        font-size: 0.9rem;
+        flex-shrink: 0;
+      }
+      .child-row .child-drag:hover { opacity: 1; }
+      .child-row.dragging { opacity: 0.4; }
+      .child-row.drop-target { outline: 2px dashed var(--highlight); }
+      .child-row .child-prio {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        flex-shrink: 0;
+      }
+      .child-row .child-key {
+        font-weight: 600;
+        color: var(--highlight);
+        flex-shrink: 0;
+      }
+      .child-row .child-title {
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        opacity: 0.85;
+      }
+      .child-row .child-state {
+        font-size: 0.7rem;
+        padding: 1px 5px;
+        border-radius: 3px;
+        opacity: 0.7;
+        flex-shrink: 0;
+      }
+      .child-row .child-remove {
+        background: none;
+        border: none;
+        color: var(--text-muted);
+        font-size: 1rem;
+        cursor: pointer;
+        padding: 0 2px;
+        line-height: 1;
+      }
+      .child-row .child-remove:hover { color: var(--highlight); }
+      .parent-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        background: var(--bg-accent);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 2px 10px;
+        font-size: 0.78rem;
+        color: var(--highlight);
+        text-decoration: none;
+      }
+      .parent-badge:hover { background: var(--bg); }
+      .parent-badge::before {
+        content: '↑';
+        opacity: 0.6;
+      }
+      /* Card child progress mini-bar */
+      .card-progress {
+        margin-top: 6px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 0.7rem;
+        color: var(--text-dim);
+      }
+      .card-progress-bar {
+        flex: 1;
+        height: 4px;
+        background: var(--border);
+        border-radius: 2px;
+        overflow: hidden;
+        position: relative;
+      }
+      .card-progress-fill {
+        position: absolute;
+        top: 0; left: 0; bottom: 0;
+        background: var(--highlight);
+        opacity: 0.6;
+      }
+      /* Card multi-select state + action bar */
+      .card.selected {
+        outline: 2px solid var(--highlight);
+        outline-offset: -2px;
+        background: var(--bg-accent);
+      }
+      .multi-select-bar {
+        position: fixed;
+        bottom: 24px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 8px 16px;
+        box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        font-size: 0.85rem;
+        z-index: 1000;
+      }
+      .multi-select-bar .selection-count {
+        color: var(--text);
+        font-weight: 600;
+      }
       .search-results-dropdown .search-result-row {
         padding: 6px 10px;
         cursor: pointer;
@@ -10169,6 +10315,10 @@
         <!-- Settings Tab -->
         <div class="detail-tab-content active" id="detailTabSettings" data-tab="settings">
         <div class="detail-section">
+          <!-- TRACK-281: Parent badge — visible when item is a child of a group -->
+          <div id="parentBadgeWrap" style="display:none;margin-bottom:6px">
+            <a href="#" id="parentBadge" class="parent-badge" title="Open parent group"></a>
+          </div>
           <div class="detail-field">
             <input
               type="text"
@@ -10296,6 +10446,15 @@
               rows="12"
               placeholder="Add a description (supports markdown)..."
             ></textarea>
+          </div>
+        </div>
+        <!-- TRACK-281: Children panel (visible when item has parent_of children) -->
+        <div class="detail-section" id="childrenSection" style="display:none">
+          <h3>Children <span id="childrenCount" style="opacity:0.5;font-size:0.8rem;font-weight:normal;"></span></h3>
+          <div class="children-stats" id="childrenStats"></div>
+          <div class="children-list" id="detailChildren"></div>
+          <div class="children-add-wrapper">
+            <button class="btn btn-ghost btn-sm" id="childrenAddBtn">+ Add child</button>
           </div>
         </div>
         <div class="detail-section">
@@ -10682,6 +10841,36 @@
           <button class="btn btn-ghost btn-sm" id="addLinkCancel">Cancel</button>
         </div>
       </div>
+    </div>
+
+    <!-- TRACK-281: Group as New Item modal -->
+    <div class="modal-overlay" id="groupModal">
+      <div class="modal" style="max-width: 520px">
+        <div class="modal-header">
+          <h2>Group as new item</h2>
+          <button class="btn-icon detail-close" id="groupModalClose">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div id="groupModalSummary" style="margin-bottom:12px;font-size:0.85rem;color:var(--text-dim)"></div>
+          <label style="display:block;font-size:0.85rem;color:var(--text-dim);margin-bottom:4px">Title</label>
+          <input type="text" id="groupModalTitle" style="width:100%;margin-bottom:12px" />
+          <label style="display:block;font-size:0.85rem;color:var(--text-dim);margin-bottom:4px">Description (optional)</label>
+          <textarea id="groupModalDescription" rows="3" style="width:100%;margin-bottom:12px"></textarea>
+          <label style="display:block;font-size:0.85rem;color:var(--text-dim);margin-bottom:4px">Target project</label>
+          <select id="groupModalProject" style="width:100%"></select>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-ghost btn-sm" id="groupModalCancel">Cancel</button>
+          <button class="btn btn-primary btn-sm" id="groupModalSubmit">Create group</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- TRACK-281: Multi-select action bar -->
+    <div class="multi-select-bar" id="multiSelectBar" style="display:none">
+      <span class="selection-count" id="multiSelectCount">0 selected</span>
+      <button class="btn btn-primary btn-sm" id="multiSelectGroup">Group as new item</button>
+      <button class="btn btn-ghost btn-sm" id="multiSelectCancel">Cancel</button>
     </div>
 
     <!-- Comment Quick-Reply Bottom Sheet -->
@@ -13174,8 +13363,10 @@
           }
 
           $$(".card", trackerEl).forEach((el) => {
-            el.addEventListener("click", () => openDetail(el.dataset.id));
+            el.addEventListener("click", (e) => handleCardClick(e, el));
           });
+          // TRACK-281: re-apply visual selection state after re-render.
+          syncMultiSelectVisuals();
           $$(".column-add", trackerEl).forEach((el) => {
             el.addEventListener("click", (e) => {
               e.stopPropagation();
@@ -13717,6 +13908,17 @@
       </div>` : ""}
     </div>`;
           const spaceIcon = item.space_type && item.space_type !== "standard" && SPACE_TYPES[item.space_type] ? `<span class="card-space-icon" title="${esc(SPACE_TYPES[item.space_type].label)} space">${SPACE_TYPES[item.space_type].icon}</span>` : "";
+          // TRACK-281: group/parent progress mini-bar
+          const cc = item.child_counts;
+          const progressHtml = cc && cc.total > 0
+            ? (() => {
+                const pct = Math.round((cc.done / cc.total) * 100);
+                return `<div class="card-progress" title="${cc.done} done · ${cc.in_progress} in progress · ${cc.open} open">
+                  <span>${cc.done}/${cc.total}</span>
+                  <span class="card-progress-bar"><span class="card-progress-fill" style="width:${pct}%"></span></span>
+                </div>`;
+              })()
+            : "";
           return `<div class="card" data-id="${esc(item.id)}" data-state="${esc(item.state)}" data-attention="${cardAttention(item)}" draggable="true">
     ${agentStatusEmoji}
     ${badgeHtml}
@@ -13751,6 +13953,7 @@
       <button class="card-comment-btn" onclick="openCommentSheet('${esc(item.id)}'); event.stopPropagation();" title="Comments"><svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M2 2a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2v3l3-3h7a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H2z"/></svg><span class="comment-count-num">${item.comment_count || 0}</span></button>
       <span class="card-time">${timeAgo(item.updated_at)}</span>
     </div>
+    ${progressHtml}
     ${expandedInfoHtml}
     ${actionsHtml}
   </div>`;
@@ -16099,6 +16302,8 @@
 
           // TRACK-280: Related links
           loadRelatedLinks(item.id);
+          // TRACK-281: Children panel + Parent badge
+          loadGroupLinks(item.id);
 
           // Session viewer (live SSE feed for runner-mode sessions)
           // Skip re-render if user is actively viewing sessions tab to avoid disrupting SSE/transcript state
@@ -16392,8 +16597,7 @@
         // list (or with no entries) are not rendered.
         const RELATED_GROUPS = [
           { rel: 'relates_to', label: 'Related' },
-          { rel: 'parent_of', label: 'Children' },
-          { rel: 'child_of', label: 'Parent' },
+          // TRACK-281: parent_of/child_of moved to dedicated Children panel + Parent badge.
           { rel: 'duplicates', label: 'Duplicates' },
           { rel: 'duplicated_by', label: 'Duplicated by' },
           { rel: 'supersedes', label: 'Supersedes' },
@@ -16613,6 +16817,395 @@
               resultsEl.style.display = 'block';
             }
           }, 200);
+        });
+
+        // ── Groups: Children panel + Parent badge (TRACK-281) ──
+
+        // State labels used for the children stats line. Buckets match the
+        // server-side getChildCountsBatch grouping.
+        const CHILDREN_STATS_BUCKETS = [
+          { key: 'done', label: 'done', color: '#5ba36a' },
+          { key: 'in_progress', label: 'in progress', color: '#5b8ea3' },
+          { key: 'open', label: 'open', color: '#a3915b' },
+        ];
+
+        async function loadGroupLinks(itemId) {
+          const sec = $('#childrenSection');
+          const parentWrap = $('#parentBadgeWrap');
+          if (!sec || !parentWrap) return;
+          // Reset to hidden state until we know.
+          sec.style.display = 'none';
+          parentWrap.style.display = 'none';
+          try {
+            const data = await apiGet(`/items/${itemId}/children`);
+            renderChildrenPanel(itemId, data.children || []);
+            renderParentBadge(data.parent);
+          } catch (e) {
+            // Best-effort load — fail silently rather than disrupt the detail panel.
+          }
+        }
+
+        function renderParentBadge(parent) {
+          const wrap = $('#parentBadgeWrap');
+          const badge = $('#parentBadge');
+          if (!wrap || !badge) return;
+          if (!parent) {
+            wrap.style.display = 'none';
+            return;
+          }
+          badge.textContent = `Parent: ${parent.key || parent.id.substring(0,8)} — ${parent.title || ''}`;
+          badge.onclick = (e) => {
+            e.preventDefault();
+            if (parent.project_id && parent.project_id !== currentProjectId) {
+              switchProject(parent.project_id);
+            }
+            openDetail(parent.id);
+          };
+          wrap.style.display = '';
+        }
+
+        function renderChildrenPanel(parentId, children) {
+          const sec = $('#childrenSection');
+          const listEl = $('#detailChildren');
+          const countEl = $('#childrenCount');
+          const statsEl = $('#childrenStats');
+          if (!sec || !listEl) return;
+          listEl.innerHTML = '';
+          if (children.length === 0) {
+            // Hide the panel completely when there are no children. The "+ Add child"
+            // entry point lives on the Related panel via "parent_of" relation
+            // (kept available via the Add Link modal). Hidden-by-default keeps
+            // ordinary leaf items uncluttered.
+            sec.style.display = 'none';
+            return;
+          }
+          sec.style.display = '';
+          countEl.textContent = `(${children.length})`;
+
+          // Build stats.
+          let done = 0, ip = 0, open = 0;
+          for (const c of children) {
+            if (c.state === 'done' || c.state === 'cancelled') done++;
+            else if (c.state === 'in_development' || c.state === 'in_review' || c.state === 'testing') ip++;
+            else open++;
+          }
+          const total = children.length;
+          const summary = `${total} children — ${done} done, ${ip} in progress, ${open} open`;
+          statsEl.innerHTML = '';
+          const summaryEl = document.createElement('span');
+          summaryEl.textContent = summary;
+          statsEl.appendChild(summaryEl);
+
+          // Sort: open before done. Inside each, by priority then by position.
+          const sorted = [...children].sort((a, b) => {
+            const aDone = (a.state === 'done' || a.state === 'cancelled') ? 1 : 0;
+            const bDone = (b.state === 'done' || b.state === 'cancelled') ? 1 : 0;
+            if (aDone !== bDone) return aDone - bDone;
+            const ap = PRIORITY_ORDER[a.priority] ?? 99;
+            const bp = PRIORITY_ORDER[b.priority] ?? 99;
+            if (ap !== bp) return ap - bp;
+            const apos = a.link_position ?? 1e9;
+            const bpos = b.link_position ?? 1e9;
+            return apos - bpos;
+          });
+
+          for (const c of sorted) {
+            listEl.appendChild(buildChildRow(parentId, c));
+          }
+
+          enableChildDragReorder(parentId, listEl);
+        }
+
+        function buildChildRow(parentId, child) {
+          const row = document.createElement('div');
+          row.className = 'child-row';
+          row.draggable = true;
+          row.dataset.childId = child.id;
+          row.dataset.linkId = child.link_id;
+
+          const drag = document.createElement('span');
+          drag.className = 'child-drag';
+          drag.textContent = '⋮⋮';
+          drag.title = 'Drag to reorder';
+          row.appendChild(drag);
+
+          const prioOpt = (typeof PRIORITY_OPTIONS !== 'undefined')
+            ? PRIORITY_OPTIONS.find((p) => p.value === child.priority)
+            : null;
+          const prioColor = prioOpt ? prioOpt.color : 'var(--border)';
+          const prio = document.createElement('span');
+          prio.className = 'child-prio';
+          prio.style.background = prioColor;
+          prio.title = `Priority: ${child.priority || 'none'}`;
+          row.appendChild(prio);
+
+          const keySpan = document.createElement('span');
+          keySpan.className = 'child-key';
+          keySpan.textContent = child.key || child.id.substring(0, 8);
+          row.appendChild(keySpan);
+
+          const titleSpan = document.createElement('span');
+          titleSpan.className = 'child-title';
+          titleSpan.textContent = child.title || '(untitled)';
+          row.appendChild(titleSpan);
+
+          if (child.state) {
+            const stateColor = STATE_COLORS[child.state] || '#636e72';
+            const stateSpan = document.createElement('span');
+            stateSpan.className = 'child-state';
+            stateSpan.style.background = stateColor + '22';
+            stateSpan.style.color = stateColor;
+            stateSpan.textContent = STATE_LABELS[child.state] || child.state;
+            row.appendChild(stateSpan);
+          }
+
+          const removeBtn = document.createElement('button');
+          removeBtn.className = 'child-remove';
+          removeBtn.title = 'Remove from group';
+          removeBtn.textContent = '×';
+          removeBtn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            try {
+              await apiDelete(`/items/${parentId}/links/${encodeURIComponent(child.link_id)}`);
+              toast('Child removed');
+              loadGroupLinks(parentId);
+            } catch (err) {
+              toast('Failed to remove child: ' + err.message, 'error');
+            }
+          });
+          row.appendChild(removeBtn);
+
+          row.addEventListener('click', (e) => {
+            // Don't navigate when clicking the drag handle or remove button.
+            if (e.target === drag || e.target === removeBtn) return;
+            if (child.project_id && child.project_id !== currentProjectId) {
+              switchProject(child.project_id);
+            }
+            openDetail(child.id);
+          });
+
+          return row;
+        }
+
+        function enableChildDragReorder(parentId, listEl) {
+          let draggingEl = null;
+          let overEl = null;
+
+          listEl.querySelectorAll('.child-row').forEach((row) => {
+            row.addEventListener('dragstart', (e) => {
+              draggingEl = row;
+              row.classList.add('dragging');
+              e.dataTransfer.effectAllowed = 'move';
+            });
+            row.addEventListener('dragend', () => {
+              if (draggingEl) draggingEl.classList.remove('dragging');
+              if (overEl) overEl.classList.remove('drop-target');
+              draggingEl = null;
+              overEl = null;
+            });
+            row.addEventListener('dragover', (e) => {
+              e.preventDefault();
+              if (overEl && overEl !== row) overEl.classList.remove('drop-target');
+              if (row !== draggingEl) {
+                row.classList.add('drop-target');
+                overEl = row;
+              }
+            });
+            row.addEventListener('drop', async (e) => {
+              e.preventDefault();
+              if (!draggingEl || draggingEl === row) return;
+              const rect = row.getBoundingClientRect();
+              const after = (e.clientY - rect.top) > rect.height / 2;
+              row.parentNode.insertBefore(draggingEl, after ? row.nextSibling : row);
+              row.classList.remove('drop-target');
+              const ids = Array.from(listEl.querySelectorAll('.child-row')).map((r) => r.dataset.childId);
+              try {
+                await apiPatch(`/items/${parentId}/children/reorder`, { child_ids: ids });
+              } catch (err) {
+                toast('Failed to save order: ' + err.message, 'error');
+                loadGroupLinks(parentId);
+              }
+            });
+          });
+        }
+
+        // "+ Add child" reuses the existing Add Link modal but pre-selects
+        // parent_of and reloads the children panel on success.
+        $('#childrenAddBtn').addEventListener('click', () => {
+          if (!detailItemId) return;
+          openAddLinkModal(detailItemId);
+          // Pre-select parent_of relation after the modal opens.
+          setTimeout(() => {
+            const sel = $('#addLinkRelation');
+            if (sel) sel.value = 'parent_of';
+          }, 60);
+        });
+
+        // ── Groups: Multi-select + Group as new item (TRACK-281) ──
+
+        // Multi-select state. Selected item IDs + the anchor card for range-select.
+        const multiSelectIds = new Set();
+        let multiSelectAnchorId = null;
+
+        // Cache of {id -> {key, title}} for cards currently in the DOM,
+        // used to build the group title default and modal summary.
+        const cardMetaCache = new Map();
+
+        function handleCardClick(e, el) {
+          const itemId = el.dataset.id;
+          if (!itemId) return;
+          // Shift-click toggles multi-select. Plain click clears selection and opens detail.
+          if (e.shiftKey || e.metaKey || e.ctrlKey) {
+            e.preventDefault();
+            e.stopPropagation();
+            if (multiSelectIds.has(itemId)) {
+              multiSelectIds.delete(itemId);
+            } else {
+              multiSelectIds.add(itemId);
+              multiSelectAnchorId = itemId;
+            }
+            cacheCardMeta(el);
+            syncMultiSelectVisuals();
+            return;
+          }
+          // Plain click: if multi-select is active, clear and open detail (don't add).
+          if (multiSelectIds.size > 0) {
+            clearMultiSelect();
+          }
+          openDetail(itemId);
+        }
+
+        function cacheCardMeta(cardEl) {
+          const id = cardEl.dataset.id;
+          if (!id) return;
+          const key = cardEl.querySelector('.card-key')?.textContent || '';
+          const title = cardEl.querySelector('.card-title')?.textContent || '';
+          cardMetaCache.set(id, { key, title });
+        }
+
+        function syncMultiSelectVisuals() {
+          // Apply .selected class to cards in the DOM matching the selection set.
+          document.querySelectorAll('.card').forEach((c) => {
+            const sel = multiSelectIds.has(c.dataset.id);
+            c.classList.toggle('selected', sel);
+            if (sel) cacheCardMeta(c);
+          });
+          const bar = $('#multiSelectBar');
+          const count = $('#multiSelectCount');
+          if (!bar || !count) return;
+          if (multiSelectIds.size === 0) {
+            bar.style.display = 'none';
+          } else {
+            bar.style.display = '';
+            count.textContent = multiSelectIds.size + ' selected';
+          }
+        }
+
+        function clearMultiSelect() {
+          multiSelectIds.clear();
+          multiSelectAnchorId = null;
+          syncMultiSelectVisuals();
+        }
+
+        $('#multiSelectCancel')?.addEventListener('click', clearMultiSelect);
+
+        $('#multiSelectGroup')?.addEventListener('click', () => {
+          if (multiSelectIds.size < 2) {
+            toast('Select at least 2 items to group', 'error');
+            return;
+          }
+          openGroupModal();
+        });
+
+        function openGroupModal() {
+          const modal = $('#groupModal');
+          if (!modal) return;
+          const ids = Array.from(multiSelectIds);
+          const metas = ids.map((id) => cardMetaCache.get(id)).filter(Boolean);
+          const summaryEl = $('#groupModalSummary');
+          const titleEl = $('#groupModalTitle');
+          const descEl = $('#groupModalDescription');
+          const projSel = $('#groupModalProject');
+
+          summaryEl.innerHTML = 'Grouping <strong>' + ids.length + '</strong> items: ' +
+            metas.slice(0, 5).map((m) => esc(m.key || m.title)).join(', ') +
+            (metas.length > 5 ? ', …' : '');
+
+          // Default title from the first 3 titles.
+          const firstTitles = metas.slice(0, 3).map((m) => m.title).filter(Boolean);
+          titleEl.value = firstTitles.length > 0
+            ? 'Group: ' + firstTitles.join(', ') + (metas.length > 3 ? '…' : '')
+            : 'Group';
+          descEl.value = '';
+
+          // Populate target project select. Default to current project.
+          projSel.innerHTML = '';
+          (projectsCache || []).forEach((p) => {
+            const opt = document.createElement('option');
+            opt.value = p.id;
+            opt.textContent = p.name || p.key || p.id.substring(0, 8);
+            if (p.id === currentProjectId) opt.selected = true;
+            projSel.appendChild(opt);
+          });
+
+          modal.classList.add('open');
+          setTimeout(() => titleEl.focus(), 50);
+        }
+
+        function closeGroupModal() {
+          $('#groupModal')?.classList.remove('open');
+        }
+
+        $('#groupModalClose')?.addEventListener('click', closeGroupModal);
+        $('#groupModalCancel')?.addEventListener('click', closeGroupModal);
+
+        $('#groupModalSubmit')?.addEventListener('click', async () => {
+          const title = $('#groupModalTitle').value.trim();
+          const description = $('#groupModalDescription').value.trim();
+          const targetProjectId = $('#groupModalProject').value;
+          if (!title) {
+            toast('Title is required', 'error');
+            return;
+          }
+          const childIds = Array.from(multiSelectIds);
+          if (childIds.length < 2) {
+            toast('Select at least 2 items to group', 'error');
+            return;
+          }
+          try {
+            const result = await apiPost('/items/group', {
+              title,
+              description: description || undefined,
+              child_item_ids: childIds,
+              target_project_id: targetProjectId || undefined,
+              actor: 'dashboard',
+            });
+            if (result.error) {
+              toast(result.error, 'error');
+              return;
+            }
+            toast('Group created: ' + (result.key || result.id), 'success');
+            closeGroupModal();
+            clearMultiSelect();
+            // If group was created in another project, switch first.
+            if (result.project_id && result.project_id !== currentProjectId) {
+              await switchProject(result.project_id);
+            } else {
+              refreshCurrentView();
+            }
+            openDetail(result.id);
+          } catch (e) {
+            toast('Failed to create group: ' + (e?.message || e), 'error');
+          }
+        });
+
+        // Esc clears multi-select when no modal is open.
+        document.addEventListener('keydown', (e) => {
+          if (e.key !== 'Escape') return;
+          if ($('#groupModal')?.classList.contains('open')) return;
+          if (multiSelectIds.size > 0) {
+            clearMultiSelect();
+          }
         });
 
         // ── Attachments ──

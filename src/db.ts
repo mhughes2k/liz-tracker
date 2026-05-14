@@ -219,6 +219,8 @@ export interface Link {
   source: LinkSource;
   confidence: number | null;
   note: string | null;
+  /** TRACK-281: drag-reorder position for parent_of children. Null for non-ordered relations. */
+  position: number | null;
   created_by: string;
   created_at: string;
 }
@@ -418,6 +420,7 @@ function createSchema(database: Database.Database): void {
 
     -- TRACK-280: Typed item-to-item links (generic edge table, separate from
     -- tracker_dependencies which carries dispatch/orchestrator semantics).
+    -- TRACK-281: added optional position column for drag-reorder of parent_of children.
     CREATE TABLE IF NOT EXISTS tracker_links (
       id TEXT PRIMARY KEY,
       from_item_id TEXT NOT NULL,
@@ -427,6 +430,7 @@ function createSchema(database: Database.Database): void {
       source TEXT NOT NULL DEFAULT 'manual',
       confidence REAL,
       note TEXT,
+      position INTEGER DEFAULT NULL,
       created_by TEXT NOT NULL,
       created_at TEXT NOT NULL,
       FOREIGN KEY (from_item_id) REFERENCES tracker_work_items(id) ON DELETE CASCADE,
@@ -699,6 +703,15 @@ export function initTrackerDatabase(): void {
   try {
     db.exec(
       "ALTER TABLE tracker_execution_audits ADD COLUMN session_title TEXT DEFAULT NULL",
+    );
+  } catch {
+    // Column already exists
+  }
+
+  // TRACK-281: add position column to tracker_links for drag-reorder of parent_of children
+  try {
+    db.exec(
+      "ALTER TABLE tracker_links ADD COLUMN position INTEGER DEFAULT NULL",
     );
   } catch {
     // Column already exists
@@ -2829,6 +2842,7 @@ export function addLink(args: {
   source?: LinkSource;
   confidence?: number | null;
   note?: string | null;
+  position?: number | null;
   created_by: string;
 }): Link {
   if (!VALID_LINK_RELATIONS.includes(args.relation as LinkRelation)) {
@@ -2845,6 +2859,19 @@ export function addLink(args: {
   if (!fromItem) throw new Error("from_item_id not found");
   const toItem = getWorkItem(args.to_item_id);
   if (!toItem) throw new Error("to_item_id not found");
+
+  // TRACK-281: cycle prevention for parent_of / child_of. The two relations are
+  // inverses of each other and together form a directed acyclic graph. Both
+  // forms collapse to the same parent→child edge for cycle-detection purposes.
+  if (relation === "parent_of" || relation === "child_of") {
+    const parentId = relation === "parent_of" ? args.from_item_id : args.to_item_id;
+    const childId = relation === "parent_of" ? args.to_item_id : args.from_item_id;
+    if (wouldCreateParentCycle(parentId, childId)) {
+      throw new Error(
+        "Adding this parent_of link would create a cycle in the group hierarchy",
+      );
+    }
+  }
 
   const symmetric = SYMMETRIC_RELATIONS.has(relation) ? 1 : 0;
 
@@ -2885,6 +2912,19 @@ export function addLink(args: {
     return existing;
   }
 
+  // TRACK-281: auto-assign position for new parent_of children so newly-added
+  // children sort to the end of the list. Callers can override by passing
+  // position explicitly (e.g. during a drag-reorder write).
+  let position: number | null = args.position ?? null;
+  if (position === null && relation === "parent_of") {
+    const maxRow = db
+      .prepare(
+        "SELECT MAX(position) AS maxPos FROM tracker_links WHERE from_item_id = ? AND relation = 'parent_of'",
+      )
+      .get(args.from_item_id) as { maxPos: number | null };
+    position = (maxRow?.maxPos ?? 0) + 1;
+  }
+
   const link: Link = {
     id: genId(),
     from_item_id: args.from_item_id,
@@ -2894,12 +2934,13 @@ export function addLink(args: {
     source: args.source || "manual",
     confidence: args.confidence ?? null,
     note: args.note ?? null,
+    position,
     created_by: args.created_by,
     created_at: now(),
   };
   db.prepare(
-    `INSERT INTO tracker_links (id, from_item_id, to_item_id, relation, symmetric, source, confidence, note, created_by, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO tracker_links (id, from_item_id, to_item_id, relation, symmetric, source, confidence, note, position, created_by, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     link.id,
     link.from_item_id,
@@ -2909,6 +2950,7 @@ export function addLink(args: {
     link.source,
     link.confidence,
     link.note,
+    link.position,
     link.created_by,
     link.created_at,
   );
@@ -3076,6 +3118,231 @@ export function listLinksByRelation(
   relation: LinkRelation,
 ): ExpandedLink[] {
   return listLinks(workItemId, relation);
+}
+
+// ── Groups (TRACK-281) ──
+
+/**
+ * Detect whether adding a parent_of edge from `parentId` to `childId` would
+ * introduce a cycle. Walks descendants of `childId` via parent_of edges and
+ * returns true if `parentId` is reachable. Guards against existing cycles
+ * with a visited set so a malformed graph can't hang the check.
+ */
+export function wouldCreateParentCycle(parentId: string, childId: string): boolean {
+  if (parentId === childId) return true;
+  const stmt = db.prepare(
+    "SELECT to_item_id FROM tracker_links WHERE from_item_id = ? AND relation = 'parent_of'",
+  );
+  const visited = new Set<string>();
+  const stack: string[] = [childId];
+  while (stack.length > 0) {
+    const node = stack.pop()!;
+    if (visited.has(node)) continue;
+    visited.add(node);
+    const rows = stmt.all(node) as Array<{ to_item_id: string }>;
+    for (const r of rows) {
+      if (r.to_item_id === parentId) return true;
+      stack.push(r.to_item_id);
+    }
+  }
+  return false;
+}
+
+/**
+ * Reorder parent_of children for a parent item. Writes the position column
+ * on each link row in order. Children not in `orderedChildIds` are not
+ * touched. Returns the number of rows updated.
+ */
+export function reorderChildren(
+  parentItemId: string,
+  orderedChildIds: string[],
+  actor: string,
+): number {
+  if (!Array.isArray(orderedChildIds) || orderedChildIds.length === 0) return 0;
+  const upd = db.prepare(
+    "UPDATE tracker_links SET position = ? WHERE from_item_id = ? AND to_item_id = ? AND relation = 'parent_of'",
+  );
+  let changed = 0;
+  const tx = db.transaction(() => {
+    for (let i = 0; i < orderedChildIds.length; i++) {
+      const res = upd.run(i + 1, parentItemId, orderedChildIds[i]);
+      if (res.changes > 0) changed++;
+    }
+  });
+  tx();
+
+  if (changed > 0) {
+    const parent = getWorkItem(parentItemId);
+    if (parent) {
+      logActivity({
+        project_id: parent.project_id,
+        item_id: parent.id,
+        action: "link.reordered",
+        actor,
+        summary: `Reordered ${changed} children of ${getWorkItemKey(parent)}`,
+        details: { count: changed },
+      });
+    }
+  }
+  return changed;
+}
+
+/**
+ * Get hydrated children for a parent item (parent_of outgoing links), sorted
+ * by position ASC NULLS LAST, then by priority, then by created_at.
+ *
+ * Returns the child work items with the link row's position attached.
+ */
+export interface ChildItem extends WorkItem {
+  link_id: string;
+  link_position: number | null;
+}
+
+export function getChildItems(parentItemId: string): ChildItem[] {
+  const rows = db
+    .prepare(
+      `SELECT l.id AS link_id, l.position AS link_position, w.*
+         FROM tracker_links l
+         JOIN tracker_work_items w ON w.id = l.to_item_id
+        WHERE l.from_item_id = ? AND l.relation = 'parent_of'
+        ORDER BY (l.position IS NULL), l.position ASC, l.created_at ASC`,
+    )
+    .all(parentItemId) as Array<WorkItem & { link_id: string; link_position: number | null }>;
+  return rows as ChildItem[];
+}
+
+/**
+ * Get the parent item for a child via the child_of side of a parent_of link.
+ * An item can technically have multiple parents (we allow it), but the UI
+ * surfaces only the first. Returns null when no parent is set.
+ */
+export function getParentItem(childItemId: string): WorkItem | null {
+  const row = db
+    .prepare(
+      `SELECT w.* FROM tracker_links l
+         JOIN tracker_work_items w ON w.id = l.from_item_id
+        WHERE l.to_item_id = ? AND l.relation = 'parent_of'
+        ORDER BY l.created_at ASC
+        LIMIT 1`,
+    )
+    .get(childItemId) as WorkItem | undefined;
+  return row || null;
+}
+
+export interface ChildCounts {
+  total: number;
+  done: number;
+  in_progress: number;
+  open: number;
+}
+
+/**
+ * Batch-fetch child counts for a list of parent IDs in a single query. Used
+ * by the kanban/list views to render "12/15 done" progress rollups without
+ * issuing per-card requests.
+ *
+ * Returns a Map keyed by parent item id. Items with no children are absent.
+ *
+ * Counts are bucketed:
+ *  - done: state in (done, cancelled)
+ *  - in_progress: state in (in_development, in_review, testing)
+ *  - open: everything else (brainstorming, clarification, approved, needs_input)
+ */
+export function getChildCountsBatch(
+  parentItemIds: string[],
+): Map<string, ChildCounts> {
+  const map = new Map<string, ChildCounts>();
+  if (!parentItemIds.length) return map;
+  const placeholders = parentItemIds.map(() => "?").join(",");
+  const rows = db
+    .prepare(
+      `SELECT l.from_item_id AS parent_id, w.state AS state, COUNT(*) AS n
+         FROM tracker_links l
+         JOIN tracker_work_items w ON w.id = l.to_item_id
+        WHERE l.relation = 'parent_of'
+          AND l.from_item_id IN (${placeholders})
+        GROUP BY l.from_item_id, w.state`,
+    )
+    .all(...parentItemIds) as Array<{ parent_id: string; state: string; n: number }>;
+  for (const r of rows) {
+    let counts = map.get(r.parent_id);
+    if (!counts) {
+      counts = { total: 0, done: 0, in_progress: 0, open: 0 };
+      map.set(r.parent_id, counts);
+    }
+    counts.total += r.n;
+    if (r.state === "done" || r.state === "cancelled") counts.done += r.n;
+    else if (
+      r.state === "in_development" ||
+      r.state === "in_review" ||
+      r.state === "testing"
+    ) counts.in_progress += r.n;
+    else counts.open += r.n;
+  }
+  return map;
+}
+
+/**
+ * Create a "group" parent item that has parent_of links to each of the given
+ * children. Convenience wrapper for the multi-select "Group as new item" flow
+ * in the dashboard.
+ *
+ * Behaviour:
+ *  - Creates the parent in `target_project_id` (defaults to the first child's project).
+ *  - Adds parent_of links to each unique child, skipping invalid IDs silently.
+ *  - Skips children that would create a cycle (so it's safe to call on a set
+ *    that already includes group items).
+ *  - Returns the new parent item.
+ */
+export function createGroupFromItems(args: {
+  title: string;
+  description?: string;
+  child_item_ids: string[];
+  target_project_id?: string;
+  created_by: string;
+}): WorkItem {
+  if (!args.title || !args.title.trim()) {
+    throw new Error("Group title is required");
+  }
+  const childIds = Array.from(new Set(args.child_item_ids || []));
+  if (childIds.length < 2) {
+    throw new Error("At least 2 child items are required to create a group");
+  }
+
+  // Resolve children + pick default project from first valid child.
+  const children: WorkItem[] = [];
+  for (const id of childIds) {
+    const item = getWorkItem(id);
+    if (item) children.push(item);
+  }
+  if (children.length < 2) {
+    throw new Error("Need at least 2 valid child items");
+  }
+  const projectId = args.target_project_id || children[0].project_id;
+
+  const parent = createWorkItem({
+    project_id: projectId,
+    title: args.title.trim(),
+    description: args.description || "",
+    created_by: args.created_by,
+    requires_code: false,
+  });
+
+  for (const child of children) {
+    try {
+      addLink({
+        from_item_id: parent.id,
+        to_item_id: child.id,
+        relation: "parent_of",
+        source: "manual",
+        created_by: args.created_by,
+      });
+    } catch {
+      // Skip invalid links (e.g. cycle attempts) silently — group creation
+      // is best-effort across the selection set.
+    }
+  }
+  return parent;
 }
 
 /**

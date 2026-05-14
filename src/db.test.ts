@@ -35,6 +35,12 @@ import {
   extractMentionKeys,
   reconcileMentionLinks,
   VALID_LINK_RELATIONS,
+  wouldCreateParentCycle,
+  reorderChildren,
+  getChildItems,
+  getParentItem,
+  getChildCountsBatch,
+  createGroupFromItems,
   createComment,
   deleteComment,
   updateComment,
@@ -2724,6 +2730,281 @@ describe('Links', () => {
       expect(VALID_LINK_RELATIONS).toContain('duplicates');
       expect(VALID_LINK_RELATIONS).toContain('parent_of');
       expect(VALID_LINK_RELATIONS).toContain('mentions');
+    });
+  });
+});
+
+// ── Groups (TRACK-281) ────────────────────────────────────────────────────────
+
+describe('Groups (parent_of)', () => {
+  let projectId: string;
+
+  beforeEach(() => {
+    _initTestTrackerDatabase();
+    const p = createProject({ name: 'Group Test', short_name: 'GT' });
+    projectId = p.id;
+  });
+
+  describe('wouldCreateParentCycle', () => {
+    it('detects self-parent as a cycle', () => {
+      const a = createWorkItem({ project_id: projectId, title: 'A' });
+      expect(wouldCreateParentCycle(a.id, a.id)).toBe(true);
+    });
+
+    it('returns false when no parent_of edges exist', () => {
+      const a = createWorkItem({ project_id: projectId, title: 'A' });
+      const b = createWorkItem({ project_id: projectId, title: 'B' });
+      expect(wouldCreateParentCycle(a.id, b.id)).toBe(false);
+    });
+
+    it('detects a direct cycle (a→b then b→a)', () => {
+      const a = createWorkItem({ project_id: projectId, title: 'A' });
+      const b = createWorkItem({ project_id: projectId, title: 'B' });
+      addLink({
+        from_item_id: a.id,
+        to_item_id: b.id,
+        relation: 'parent_of',
+        created_by: 'dashboard',
+      });
+      expect(wouldCreateParentCycle(b.id, a.id)).toBe(true);
+    });
+
+    it('detects a transitive cycle (a→b→c then c→a)', () => {
+      const a = createWorkItem({ project_id: projectId, title: 'A' });
+      const b = createWorkItem({ project_id: projectId, title: 'B' });
+      const c = createWorkItem({ project_id: projectId, title: 'C' });
+      addLink({
+        from_item_id: a.id, to_item_id: b.id,
+        relation: 'parent_of', created_by: 'dashboard',
+      });
+      addLink({
+        from_item_id: b.id, to_item_id: c.id,
+        relation: 'parent_of', created_by: 'dashboard',
+      });
+      expect(wouldCreateParentCycle(c.id, a.id)).toBe(true);
+    });
+
+    it('addLink rejects parent_of cycles', () => {
+      const a = createWorkItem({ project_id: projectId, title: 'A' });
+      const b = createWorkItem({ project_id: projectId, title: 'B' });
+      addLink({
+        from_item_id: a.id, to_item_id: b.id,
+        relation: 'parent_of', created_by: 'dashboard',
+      });
+      expect(() => addLink({
+        from_item_id: b.id, to_item_id: a.id,
+        relation: 'parent_of', created_by: 'dashboard',
+      })).toThrow(/cycle/i);
+    });
+
+    it('addLink rejects child_of cycles symmetrically', () => {
+      const a = createWorkItem({ project_id: projectId, title: 'A' });
+      const b = createWorkItem({ project_id: projectId, title: 'B' });
+      addLink({
+        from_item_id: a.id, to_item_id: b.id,
+        relation: 'parent_of', created_by: 'dashboard',
+      });
+      // a is already parent of b; adding "a child_of b" would mean b→a parent_of, cycle.
+      expect(() => addLink({
+        from_item_id: a.id, to_item_id: b.id,
+        relation: 'child_of', created_by: 'dashboard',
+      })).toThrow(/cycle/i);
+    });
+  });
+
+  describe('parent_of position auto-assignment', () => {
+    it('assigns incrementing positions to new children', () => {
+      const parent = createWorkItem({ project_id: projectId, title: 'P' });
+      const c1 = createWorkItem({ project_id: projectId, title: 'C1' });
+      const c2 = createWorkItem({ project_id: projectId, title: 'C2' });
+      const c3 = createWorkItem({ project_id: projectId, title: 'C3' });
+      addLink({ from_item_id: parent.id, to_item_id: c1.id, relation: 'parent_of', created_by: 'dashboard' });
+      addLink({ from_item_id: parent.id, to_item_id: c2.id, relation: 'parent_of', created_by: 'dashboard' });
+      addLink({ from_item_id: parent.id, to_item_id: c3.id, relation: 'parent_of', created_by: 'dashboard' });
+
+      const children = getChildItems(parent.id);
+      expect(children).toHaveLength(3);
+      expect(children[0].id).toBe(c1.id);
+      expect(children[1].id).toBe(c2.id);
+      expect(children[2].id).toBe(c3.id);
+      expect(children[0].link_position).toBe(1);
+      expect(children[1].link_position).toBe(2);
+      expect(children[2].link_position).toBe(3);
+    });
+  });
+
+  describe('reorderChildren', () => {
+    it('updates positions in the supplied order', () => {
+      const parent = createWorkItem({ project_id: projectId, title: 'P' });
+      const c1 = createWorkItem({ project_id: projectId, title: 'C1' });
+      const c2 = createWorkItem({ project_id: projectId, title: 'C2' });
+      const c3 = createWorkItem({ project_id: projectId, title: 'C3' });
+      for (const c of [c1, c2, c3]) {
+        addLink({
+          from_item_id: parent.id, to_item_id: c.id,
+          relation: 'parent_of', created_by: 'dashboard',
+        });
+      }
+      const changed = reorderChildren(parent.id, [c3.id, c1.id, c2.id], 'dashboard');
+      expect(changed).toBe(3);
+
+      const children = getChildItems(parent.id);
+      expect(children.map((c) => c.id)).toEqual([c3.id, c1.id, c2.id]);
+    });
+
+    it('returns 0 for an empty order list', () => {
+      const parent = createWorkItem({ project_id: projectId, title: 'P' });
+      expect(reorderChildren(parent.id, [], 'dashboard')).toBe(0);
+    });
+  });
+
+  describe('getParentItem', () => {
+    it('returns null when item has no parent', () => {
+      const a = createWorkItem({ project_id: projectId, title: 'Orphan' });
+      expect(getParentItem(a.id)).toBeNull();
+    });
+
+    it('returns the parent via parent_of link', () => {
+      const parent = createWorkItem({ project_id: projectId, title: 'P' });
+      const child = createWorkItem({ project_id: projectId, title: 'C' });
+      addLink({
+        from_item_id: parent.id, to_item_id: child.id,
+        relation: 'parent_of', created_by: 'dashboard',
+      });
+      const p = getParentItem(child.id);
+      expect(p).not.toBeNull();
+      expect(p!.id).toBe(parent.id);
+    });
+  });
+
+  describe('getChildCountsBatch', () => {
+    it('returns empty map when no parents given', () => {
+      const m = getChildCountsBatch([]);
+      expect(m.size).toBe(0);
+    });
+
+    it('buckets children by state correctly', () => {
+      const parent = createWorkItem({ project_id: projectId, title: 'P' });
+      const cDone1 = createWorkItem({ project_id: projectId, title: 'D1' });
+      const cDone2 = createWorkItem({ project_id: projectId, title: 'D2' });
+      const cInDev = createWorkItem({ project_id: projectId, title: 'InDev' });
+      const cReview = createWorkItem({ project_id: projectId, title: 'InReview' });
+      const cBrain = createWorkItem({ project_id: projectId, title: 'Brain' });
+      const cCancelled = createWorkItem({ project_id: projectId, title: 'Cancelled' });
+
+      changeWorkItemState(cDone1.id, 'done', 'dashboard');
+      changeWorkItemState(cDone2.id, 'done', 'dashboard');
+      changeWorkItemState(cInDev.id, 'in_development', 'dashboard');
+      changeWorkItemState(cReview.id, 'in_review', 'dashboard');
+      changeWorkItemState(cCancelled.id, 'cancelled', 'dashboard');
+
+      for (const c of [cDone1, cDone2, cInDev, cReview, cBrain, cCancelled]) {
+        addLink({
+          from_item_id: parent.id, to_item_id: c.id,
+          relation: 'parent_of', created_by: 'dashboard',
+        });
+      }
+
+      const m = getChildCountsBatch([parent.id]);
+      const counts = m.get(parent.id);
+      expect(counts).toBeDefined();
+      expect(counts!.total).toBe(6);
+      expect(counts!.done).toBe(3); // 2 done + 1 cancelled
+      expect(counts!.in_progress).toBe(2); // in_development + in_review
+      expect(counts!.open).toBe(1); // brainstorming
+    });
+
+    it('omits parents with no children', () => {
+      const a = createWorkItem({ project_id: projectId, title: 'A' });
+      const m = getChildCountsBatch([a.id]);
+      expect(m.has(a.id)).toBe(false);
+    });
+  });
+
+  describe('createGroupFromItems', () => {
+    it('rejects fewer than 2 children', () => {
+      const a = createWorkItem({ project_id: projectId, title: 'A' });
+      expect(() => createGroupFromItems({
+        title: 'Group',
+        child_item_ids: [a.id],
+        created_by: 'dashboard',
+      })).toThrow(/at least 2/i);
+    });
+
+    it('rejects empty title', () => {
+      const a = createWorkItem({ project_id: projectId, title: 'A' });
+      const b = createWorkItem({ project_id: projectId, title: 'B' });
+      expect(() => createGroupFromItems({
+        title: '',
+        child_item_ids: [a.id, b.id],
+        created_by: 'dashboard',
+      })).toThrow(/title is required/i);
+    });
+
+    it('creates a parent item with parent_of links to children', () => {
+      const a = createWorkItem({ project_id: projectId, title: 'A' });
+      const b = createWorkItem({ project_id: projectId, title: 'B' });
+      const c = createWorkItem({ project_id: projectId, title: 'C' });
+      const parent = createGroupFromItems({
+        title: 'My Group',
+        description: 'Notes here',
+        child_item_ids: [a.id, b.id, c.id],
+        created_by: 'dashboard',
+      });
+      expect(parent).toBeDefined();
+      expect(parent.title).toBe('My Group');
+      expect(parent.description).toBe('Notes here');
+      expect(parent.project_id).toBe(projectId);
+
+      const children = getChildItems(parent.id);
+      expect(children.map((c) => c.id).sort()).toEqual([a.id, b.id, c.id].sort());
+    });
+
+    it('skips children that would create a cycle (best-effort)', () => {
+      const a = createWorkItem({ project_id: projectId, title: 'A' });
+      const b = createWorkItem({ project_id: projectId, title: 'B' });
+      // Make a the parent of b first.
+      addLink({
+        from_item_id: a.id, to_item_id: b.id,
+        relation: 'parent_of', created_by: 'dashboard',
+      });
+      // Now group [a, b] under a new parent — neither would cause a cycle.
+      const c = createWorkItem({ project_id: projectId, title: 'C' });
+      const parent = createGroupFromItems({
+        title: 'Group',
+        child_item_ids: [a.id, b.id, c.id],
+        created_by: 'dashboard',
+      });
+      const children = getChildItems(parent.id);
+      // All three should be linked (new parent doesn't create cycles).
+      expect(children).toHaveLength(3);
+    });
+
+    it('deduplicates child IDs', () => {
+      const a = createWorkItem({ project_id: projectId, title: 'A' });
+      const b = createWorkItem({ project_id: projectId, title: 'B' });
+      const parent = createGroupFromItems({
+        title: 'Group',
+        child_item_ids: [a.id, a.id, b.id],
+        created_by: 'dashboard',
+      });
+      const children = getChildItems(parent.id);
+      expect(children).toHaveLength(2);
+    });
+
+    it('uses target_project_id when supplied', () => {
+      const other = createProject({ name: 'Other', short_name: 'OT' });
+      const a = createWorkItem({ project_id: projectId, title: 'A' });
+      const b = createWorkItem({ project_id: projectId, title: 'B' });
+      const parent = createGroupFromItems({
+        title: 'X-project Group',
+        child_item_ids: [a.id, b.id],
+        target_project_id: other.id,
+        created_by: 'dashboard',
+      });
+      expect(parent.project_id).toBe(other.id);
+      const children = getChildItems(parent.id);
+      expect(children).toHaveLength(2);
     });
   });
 });
