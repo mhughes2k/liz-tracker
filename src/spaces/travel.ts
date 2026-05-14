@@ -833,7 +833,7 @@ Common fields on ALL segments: type, title, status (confirmed/pending/cancelled)
 RESILIENCE: The tool auto-corrects common mistakes: "carrier"→"provider", "booking_ref"→"confirmation", "booked"→"confirmed", "layover"→"activity". ISO datetime strings like "2026-03-22T06:40:00+08:00" are parsed into TimePoint format. However, using the correct format above is strongly preferred.`,
     schema: {
       item_id: z.string().describe("Work item ID or display key (e.g. \"MARTIN-96\")"),
-      segments: z.array(z.record(z.unknown())).describe("Array of segment objects. Each must have 'type' (flight/lodging/transport/activity/restaurant/meeting/note) and 'title'. Datetimes use { datetime: \"YYYY-MM-DDTHH:MM\", timezone: \"IANA/Timezone\" } format. Flights need departure/arrival as { datetime, timezone, location, detail }. Lodging needs check_in/check_out as { datetime, timezone }. Activities need start (and optionally end) as { datetime, timezone }. See tool description for full examples."),
+      segments: z.array(z.record(z.string(), z.unknown())).describe("Array of segment objects. Each must have 'type' (flight/lodging/transport/activity/restaurant/meeting/note) and 'title'. Datetimes use { datetime: \"YYYY-MM-DDTHH:MM\", timezone: \"IANA/Timezone\" } format. Flights need departure/arrival as { datetime, timezone, location, detail }. Lodging needs check_in/check_out as { datetime, timezone }. Activities need start (and optionally end) as { datetime, timezone }. See tool description for full examples."),
     },
     handler: async (args, item) => {
       const data = parseTravelSpaceData(item.space_data);
@@ -880,7 +880,7 @@ RESILIENCE: The tool auto-corrects common mistakes: "carrier"→"provider", "boo
     schema: {
       item_id: z.string().describe("Work item ID or display key (e.g. \"MARTIN-96\")"),
       segment_id: z.string().describe("Segment ID (e.g. \"seg_a1b2c3d4e5f6\"). Use tracker_get_item to see existing segments and their IDs."),
-      changes: z.record(z.unknown()).describe("Fields to update. Nested objects (departure, arrival, cost, etc.) are deep-merged. Example: { departure: { detail: \"Gate 55\" } } or { status: \"confirmed\", seat: \"12A\" }"),
+      changes: z.record(z.string(), z.unknown()).describe("Fields to update. Nested objects (departure, arrival, cost, etc.) are deep-merged. Example: { departure: { detail: \"Gate 55\" } } or { status: \"confirmed\", seat: \"12A\" }"),
     },
     handler: async (args, item) => {
       const data = parseTravelSpaceData(item.space_data);
