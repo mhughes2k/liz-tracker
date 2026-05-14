@@ -357,8 +357,8 @@ function createMcpServer(): McpServer {
 
   server.tool(
     "tracker_get_item",
-    'Get a work item with comments, transitions, and dependencies. Accepts item ID or display key like "LIZ-3".',
-    { item_id: z.string().describe('Work item ID or display key (e.g. "LIZ-3")') },
+    'Get a work item with comments, transitions, and dependencies. REQUIRED: item_id (string). Accepts a work item ID (24-char hex) or display key like "TRACK-287".',
+    { item_id: z.string().min(1).describe('REQUIRED. Work item ID (24-char hex) or display key like "TRACK-287". Must be a non-empty string.') },
     async (args) => {
       const item = getWorkItemByKey(args.item_id) || getWorkItem(args.item_id);
       if (!item) return { content: [{ type: "text", text: "Error: Work item not found" }] };
@@ -486,12 +486,12 @@ function createMcpServer(): McpServer {
 
   server.tool(
     "tracker_change_state",
-    `Change the state of a work item. Records a transition in the audit trail. Note: only human actors (dashboard) can move items to 'approved' or 'cancelled' state.`,
+    `Change the state of a work item. Records a transition in the audit trail. REQUIRED: item_id, state. Note: only human actors (dashboard) can move items to 'approved' or 'cancelled' state.`,
     {
-      item_id: z.string().describe("Work item ID or display key (e.g. \"WRITING-28\")"),
-      state: z.string().describe(`New state: ${VALID_STATES.join(", ")}`),
-      actor: z.string().optional().describe("Who is making this change"),
-      comment: z.string().optional().describe("Optional comment about why"),
+      item_id: z.string().min(1).describe("REQUIRED. Work item ID (24-char hex) or display key like \"TRACK-287\". Must be a non-empty string."),
+      state: z.string().min(1).describe(`REQUIRED. New state. Must be one of: ${VALID_STATES.join(", ")}. Example: "in_development".`),
+      actor: z.string().optional().describe("Who is making this change (e.g. \"Coder\"). Defaults to \"Coder\" if omitted."),
+      comment: z.string().optional().describe("Optional comment about why the state is changing"),
     },
     async (args) => {
       if (!VALID_STATES.includes(args.state as WorkItemState)) {
@@ -611,10 +611,10 @@ function createMcpServer(): McpServer {
 
   server.tool(
     "tracker_lock_item",
-    "Lock a work item to signal you are actively working on it. Locks auto-expire after 2 hours.",
+    "Lock a work item to signal you are actively working on it. Locks auto-expire after 2 hours. REQUIRED: item_id, agent.",
     {
-      item_id: z.string().describe("Work item ID or display key (e.g. \"WRITING-28\")"),
-      agent: z.string().describe("Agent name"),
+      item_id: z.string().min(1).describe("REQUIRED. Work item ID (24-char hex) or display key like \"TRACK-287\". Must be a non-empty string."),
+      agent: z.string().min(1).describe("REQUIRED. Name of the agent acquiring the lock (e.g. \"Coder\"). Must be a non-empty string."),
     },
     async (args) => {
       const itemId = resolveId(args.item_id);
@@ -627,8 +627,8 @@ function createMcpServer(): McpServer {
 
   server.tool(
     "tracker_unlock_item",
-    "Unlock a work item when done working or handing off.",
-    { item_id: z.string().describe("Work item ID or display key (e.g. \"WRITING-28\")") },
+    "Unlock a work item when done working or handing off. REQUIRED: item_id.",
+    { item_id: z.string().min(1).describe("REQUIRED. Work item ID (24-char hex) or display key like \"TRACK-287\". Must be a non-empty string.") },
     async (args) => {
       const itemId = resolveId(args.item_id);
       const item = unlockWorkItem(itemId);

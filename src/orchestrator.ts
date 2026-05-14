@@ -2576,24 +2576,32 @@ function buildPrompt(
   const isScheduledTask = item.space_type === "scheduled";
   
   if (item.requires_code) {
-    // Standard coder dispatch — full implementation workflow
+    // Standard coder dispatch — full implementation workflow.
+    // TRACK-287: Provide concrete tool-call syntax with all required parameters
+    // explicitly named. Abstract verbs like "lock the item" caused LLMs to
+    // omit required params (item_id, agent, state) and fail validation on first try.
     if (isScheduledTask) {
       lines.push(
         "Implement this scheduled task. Follow this workflow:",
-        "1. Move to in_development and lock the item",
-        "2. Execute the task as described above",
-        "3. **Add a comment** summarizing what was done, any findings, or status updates",
-        "4. Move to in_review and unlock",
+        `1. Call \`tracker_change_state\` with item_id="${item.id}", state="in_development", actor="Coder"`,
+        `2. Call \`tracker_lock_item\` with item_id="${item.id}", agent="Coder"`,
+        "3. Execute the task as described above",
+        `4. Call \`tracker_add_comment\` with item_id="${item.id}", author="Coder", body="<summary of what was done>"`,
+        `5. Call \`tracker_change_state\` with item_id="${item.id}", state="in_review", actor="Coder"`,
+        `6. Call \`tracker_unlock_item\` with item_id="${item.id}"`,
         "",
         "**⚠️ IMPORTANT: This is a scheduled (recurring) task.** Do NOT modify the description. The description is the permanent task definition that runs on each schedule. All status updates, findings, and results must be added as **comments only**.",
       );
     } else {
       lines.push(
         "Implement this work item. Follow your tracker-worker workflow:",
-        "1. Move to in_development and lock the item",
-        "2. Implement the changes described above",
-        "3. Run tests/build to verify",
-        "4. Comment with a summary, move to in_review, and unlock",
+        `1. Call \`tracker_change_state\` with item_id="${item.id}", state="in_development", actor="Coder"`,
+        `2. Call \`tracker_lock_item\` with item_id="${item.id}", agent="Coder"`,
+        "3. Implement the changes described above",
+        "4. Run tests/build to verify (e.g. `npm test`, `npm run build`)",
+        `5. Call \`tracker_add_comment\` with item_id="${item.id}", author="Coder", body="<summary of changes>"`,
+        `6. Call \`tracker_change_state\` with item_id="${item.id}", state="in_review", actor="Coder"`,
+        `7. Call \`tracker_unlock_item\` with item_id="${item.id}"`,
       );
     }
   } else {
@@ -2602,10 +2610,12 @@ function buildPrompt(
       "**This item does NOT require code changes.** You should read, research, think about it, and respond with your analysis and recommendations. Do NOT modify any files or write any code.",
       "",
       "Follow this workflow:",
-      "1. Move to in_development and lock the item",
-      "2. Read relevant files, research the topic, and think about the request",
-      "3. Add a detailed comment with your analysis, findings, and recommendations",
-      "4. Move to in_review and unlock",
+      `1. Call \`tracker_change_state\` with item_id="${item.id}", state="in_development", actor="Coder"`,
+      `2. Call \`tracker_lock_item\` with item_id="${item.id}", agent="Coder"`,
+      "3. Read relevant files, research the topic, and think about the request",
+      `4. Call \`tracker_add_comment\` with item_id="${item.id}", author="Coder", body="<analysis, findings, and recommendations>"`,
+      `5. Call \`tracker_change_state\` with item_id="${item.id}", state="in_review", actor="Coder"`,
+      `6. Call \`tracker_unlock_item\` with item_id="${item.id}"`,
     );
   }
 
