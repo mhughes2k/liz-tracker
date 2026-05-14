@@ -112,6 +112,17 @@ import {
   setClusterLabel,
   upgradeLinkSource,
   getLink,
+  createProposal,
+  listProposals,
+  getProposal,
+  getProposalActions,
+  setProposalActionStatus,
+  rejectProposal,
+  applyProposal,
+  getProposalStats,
+  VALID_PROPOSAL_ACTION_KINDS,
+  type ProposalActionKind,
+  type ProposalStatus,
   MAX_ATTACHMENT_SIZE,
   createDescriptionVersion,
   listDescriptionVersions,
@@ -2301,6 +2312,112 @@ Extract the structured fields from this description. Return ONLY valid JSON.`;
       // GET /embeddings/tombstones — list all tombstones (for admin/debug).
       if (parts.length === 2 && parts[1] === "tombstones" && method === "GET") {
         return json(res, listEmbeddingTombstones());
+      }
+    }
+
+    // ── Proposals (TRACK-284 / Phase 5 of TRACK-276) ──
+    if (parts[0] === "proposals") {
+      // POST /proposals — create a new proposal
+      if (parts.length === 1 && method === "POST") {
+        const body = await parseBody(req);
+        if (!body.title) return error(res, "title is required");
+        if (!Array.isArray(body.actions) || body.actions.length === 0) {
+          return error(res, "actions must be a non-empty array");
+        }
+        for (const a of body.actions) {
+          if (!a || typeof a !== "object") return error(res, "Each action must be an object");
+          if (!a.kind || !VALID_PROPOSAL_ACTION_KINDS.includes(a.kind as ProposalActionKind)) {
+            return error(res, `Invalid action kind. Valid: ${VALID_PROPOSAL_ACTION_KINDS.join(", ")}`);
+          }
+          if (!a.payload || typeof a.payload !== "object") {
+            return error(res, "Each action must have a payload object");
+          }
+        }
+        const result = createProposal({
+          title: String(body.title),
+          summary: body.summary ? String(body.summary) : null,
+          proposed_by: body.proposed_by ? String(body.proposed_by) : "Harmoni",
+          expires_in_days: typeof body.expires_in_days === "number" ? body.expires_in_days : undefined,
+          actions: body.actions,
+        });
+        return json(res, result, 201);
+      }
+
+      // GET /proposals — list proposals with optional filters
+      if (parts.length === 1 && method === "GET") {
+        const qp = queryParams(url);
+        const status = qp.get("status");
+        const since = qp.get("since");
+        const limit = qp.get("limit");
+        const offset = qp.get("offset");
+        const items = listProposals({
+          status: status ? (status as ProposalStatus) : undefined,
+          since: since ?? undefined,
+          limit: limit ? parseInt(limit, 10) : undefined,
+          offset: offset ? parseInt(offset, 10) : undefined,
+        });
+        return json(res, { proposals: items, stats: getProposalStats() });
+      }
+
+      // GET /proposals/:id — full detail including actions
+      if (parts.length === 2 && method === "GET") {
+        const proposal = getProposal(parts[1]);
+        if (!proposal) return error(res, "Proposal not found", 404);
+        const actions = getProposalActions(parts[1]);
+        return json(res, { proposal, actions });
+      }
+
+      // DELETE /proposals/:id — reject the entire proposal
+      if (parts.length === 2 && method === "DELETE") {
+        const body = await parseBody(req).catch(() => ({} as Record<string, unknown>));
+        const actor = body.actor ? String(body.actor) : "dashboard";
+        const result = rejectProposal({ proposal_id: parts[1], actor });
+        if (!result) return error(res, "Proposal not found", 404);
+        return json(res, { proposal: result });
+      }
+
+      // PATCH /proposals/:id/actions/:action_id — set action status
+      if (
+        parts.length === 4 &&
+        parts[2] === "actions" &&
+        method === "PATCH"
+      ) {
+        const body = await parseBody(req);
+        const status = body.status ? String(body.status) : "";
+        if (status !== "accepted" && status !== "rejected" && status !== "pending") {
+          return error(res, "status must be 'accepted', 'rejected', or 'pending'");
+        }
+        const actor = body.actor ? String(body.actor) : "dashboard";
+        try {
+          const action = setProposalActionStatus({
+            action_id: parts[3],
+            status: status as "accepted" | "rejected" | "pending",
+            actor,
+          });
+          if (!action) return error(res, "Action not found", 404);
+          return json(res, { action });
+        } catch (e) {
+          return error(res, e instanceof Error ? e.message : String(e));
+        }
+      }
+
+      // POST /proposals/:id/apply — apply accepted actions
+      if (parts.length === 3 && parts[2] === "apply" && method === "POST") {
+        const body = await parseBody(req).catch(() => ({} as Record<string, unknown>));
+        const actor = body.actor ? String(body.actor) : "dashboard";
+        const actionIds = Array.isArray(body.action_ids)
+          ? (body.action_ids as unknown[]).map((x) => String(x))
+          : undefined;
+        try {
+          const result = applyProposal({
+            proposal_id: parts[1],
+            action_ids: actionIds,
+            actor,
+          });
+          return json(res, result);
+        } catch (e) {
+          return error(res, e instanceof Error ? e.message : String(e), 400);
+        }
       }
     }
 

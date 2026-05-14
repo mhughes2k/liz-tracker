@@ -405,6 +405,12 @@ Write endpoints (POST, PUT, PATCH, DELETE) require a bearer token:
 | `POST` | `/api/v1/items/merge` | Merge items (TRACK-282). Body `{target_id, source_ids: [...], strategy?, transfer_comments?, transfer_attachments?, transfer_links?, actor?}`. Single transaction, reversible via target description version snapshot. |
 | `POST` | `/api/v1/items/:id/split` | Split one item into N children (TRACK-282). Body `{splits: [{title, description?, comment_regex?, labels?, priority?, target_project_id?}], preserve_source?, actor?}`. Adds parent_of links; optional regex comment extraction. |
 | `PATCH` | `/api/v1/items/bulk` | Bulk-update many items in one transaction (TRACK-282). Body `{item_ids: [...], patch: {labels?: {add, remove}, priority?, assignee?, state?, project_id?, add_links?}, actor?}`. Skips locked items. |
+| `POST` | `/api/v1/proposals` | Stage a new proposal (TRACK-284). Body `{title, summary?, proposed_by?, expires_in_days?, actions: [{kind, payload, rationale?}]}`. |
+| `GET` | `/api/v1/proposals` | List proposals (query: `status?, since?, limit?, offset?`). Returns `{proposals[], stats}`. |
+| `GET` | `/api/v1/proposals/:id` | Get a proposal with all actions. |
+| `PATCH` | `/api/v1/proposals/:id/actions/:action_id` | Set an action's status (`accepted`/`rejected`/`pending`). Body `{status, actor?}`. |
+| `POST` | `/api/v1/proposals/:id/apply` | Apply accepted actions. Body `{action_ids?, actor}`. SECURITY: actor must be human-class. Idempotent re-apply. |
+| `DELETE` | `/api/v1/proposals/:id` | Reject the entire proposal. Body `{actor?}`. |
 
 ### MCP Tools
 
@@ -442,6 +448,10 @@ Write endpoints (POST, PUT, PATCH, DELETE) require a bearer token:
 | `tracker_merge_items` | Merge N source items into a target item (single transaction). Snapshots target description, optionally appends source bodies, transfers comments (prefixed `[from KEY]`)/attachments/outbound links, adds `superseded_by` link, cancels sources. Reversible via the target's version history + composite `items.merged` activity log entry. |
 | `tracker_split_item` | Split one source item into N new children. Creates each child as a new item with parent_of link from the source, optional regex pulls matching comments off the source onto the child, optional source cancellation (stub kept by default). Snapshots source description first; activity log entry `item.split`. |
 | `tracker_bulk_update` | Apply a patch to many items in one transaction. Supports labels add/remove (set semantics), priority, assignee, state, project move, and `add_links` (every item gets the link). Locked items are skipped. State changes still go through `changeWorkItemState` — agents cannot bulk-approve. Composite `items.bulk_updated` activity entry. |
+| `tracker_propose_batch` | Stage a batch of proposed actions (merge, split, bulk_update, create_item, update_item, change_state, add_link, remove_link, merge_items, split_item) for human review. Agents like Harmoni use this to suggest multi-action changes without applying them. Returns proposal + actions with status='pending'. (TRACK-284) |
+| `tracker_apply_proposal` | Apply accepted actions from a proposal. Routes each action through the appropriate mutator. SECURITY: only human-class actors can apply; agent/system/api callers are rejected. Re-applying is idempotent. (TRACK-284) |
+| `tracker_list_proposals` | List staged proposals with optional `status` / `since` / `limit` filters. Returns `{proposals[], stats}`. |
+| `tracker_get_proposal` | Get full proposal detail including all actions and their statuses. |
 
 **Orchestrator tools:**
 
@@ -851,9 +861,55 @@ Tracker maintains a small vector index of every work item so the dashboard can s
 
 Embedding-suggested links carry `source='embedding'` and `confidence`. They are visually distinct in the UI and require a human Confirm to promote to `manual`. Tombstones suppress future suggestions for the same pair. The auto-link path never grants approval, code access, or state transitions.
 
+## Proposals (TRACK-284 / Phase 5 of TRACK-276)
+
+Proposals stage multi-action batches (merge / split / bulk_update / create / update / state-change / add_link / remove_link) for human review. Agents (e.g. Harmoni) suggest changes via `tracker_propose_batch`; nothing executes until a human applies them through the dashboard or `tracker_apply_proposal`.
+
+### Architecture
+
+| Table | Purpose |
+| --- | --- |
+| `tracker_proposals` | One row per proposal: id, title, summary, proposed_by + actor class, status (`pending`/`partially_applied`/`applied`/`rejected`/`expired`), `expires_at`, applied_by/at |
+| `tracker_proposal_actions` | Ordered actions (ordinal) per proposal: kind, JSON payload, rationale, per-action status (`pending`/`accepted`/`rejected`/`applied`/`failed`), result JSON, applied_at |
+
+### Action kinds
+
+Each action's `payload` matches the corresponding mutator's input:
+
+- `create_item` — `{project_id, title, description?, state?, priority?, assignee?, labels?, requires_code?, ...}`
+- `update_item` — `{item_id, title?, description?, priority?, assignee?, labels?, date_due?, link?}`
+- `change_state` — `{item_id, state, comment?}`
+- `add_link` — `{from_item_id, to_item_id, relation, note?}` (applied with `source='proposal'`)
+- `remove_link` — `{from_item_id, to_item_id, relation}`
+- `merge_items` — `{target_id, source_ids[], strategy?, transfer_comments?, transfer_attachments?, transfer_links?}`
+- `split_item` — `{source_id, splits: [...], preserve_source?}`
+- `bulk_update` — `{item_ids[], patch}`
+
+Item IDs accept either raw IDs or display keys (e.g. `TRACK-5`) — they're resolved at apply time.
+
+### Lifecycle
+
+1. **Stage** — agent calls `tracker_propose_batch`; proposal is created with status=`pending`, actions=`pending`. `expires_in_days` (default 7) sets `expires_at`.
+2. **Review** — human reviews via the Proposals panel in the dashboard or the REST API. Per-action accept/reject via `PATCH /proposals/:id/actions/:action_id`.
+3. **Apply** — human calls `POST /proposals/:id/apply` (or `tracker_apply_proposal`). Each accepted action runs through its normal mutator, preserving every existing actor-class rule. Failures are captured per-action without aborting the batch. Idempotent re-apply skips already-applied actions.
+4. **Final status** — `applied` (all actions applied successfully), `partially_applied` (some applied, some pending or failed), `rejected` (all cancelled), or `expired` (auto-marked after `expires_at`).
+5. **Expiry** — `expireOverdueProposals()` runs on every orchestrator `tick()`. Only proposals in `pending` or `partially_applied` with `expires_at < now` are marked `expired`.
+
+### Security
+
+- `tracker_propose_batch` forces `proposed_by_class='agent'` regardless of what the caller claims (via `classifyActor()`).
+- `applyProposal()` rejects non-human actors at the boundary. The error message says: *"Only human actors can apply proposals."*
+- Even within `applyProposal()`, each action routes through its existing mutator (`createWorkItem`, `changeWorkItemState`, `mergeItems`, …). Those mutators apply their own actor-class rules — e.g. agents still cannot approve `requires_code` items even if a human triggers the apply, because the dispatched mutator sees the human actor.
+- Applied `add_link` actions carry `source='proposal'` so the audit trail distinguishes them from manual/auto-mention/embedding links.
+- Every create/reject/apply event writes a `proposal.created` / `proposal.rejected` / `proposal.applied` activity log entry.
+
+### UI
+
+The dashboard topbar has a **Proposals** button (with a pending count badge that refreshes every 60s). Opening the panel lists proposals filtered by status; clicking a row drills into the proposal's actions with per-action Accept/Reject buttons and a top-level Apply/Reject. Successful apply shows a summary toast (applied/failed/skipped counts).
+
 ## Conventions
 
-- Database tables are prefixed with `tracker_` (projects, work_items, comments, transitions, watchers, dependencies, attachments, description_versions, activity_log, execution_audits, comment_reactions, settings, links)
+- Database tables are prefixed with `tracker_` (projects, work_items, comments, transitions, watchers, dependencies, attachments, description_versions, activity_log, execution_audits, comment_reactions, settings, links, proposals, proposal_actions)
 - All IDs are random hex strings (24 chars)
 - Timestamps are ISO 8601 strings
 - Work items have sequential keys per project (e.g. PROJ-1, PROJ-2)

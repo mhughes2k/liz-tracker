@@ -42,6 +42,14 @@ import {
   mergeItems,
   splitItem,
   bulkUpdate,
+  createProposal,
+  listProposals,
+  getProposal,
+  getProposalActions,
+  applyProposal,
+  getProposalStats,
+  VALID_PROPOSAL_ACTION_KINDS,
+  type ProposalActionKind,
   createComment,
   listComments,
   toggleReaction,
@@ -1069,6 +1077,126 @@ function createMcpServer(): McpServer {
           isError: true,
         };
       }
+    },
+  );
+
+  // ── Proposals (TRACK-284) ──
+
+  server.tool(
+    "tracker_propose_batch",
+    "Stage a batch of proposed actions for human review. Agents (like Harmoni) use this to suggest changes — merges, splits, bulk updates, links, item creation/edits — without applying them. The proposal is recorded with status='pending' and individual actions start as 'pending'. A human reviewer must accept and apply the proposal via the dashboard or `tracker_apply_proposal`. Actions accepted: " + VALID_PROPOSAL_ACTION_KINDS.join(", ") + ". Returns the created proposal with all actions.",
+    {
+      title: z.string().describe("Short title for the proposal (shown in the review UI)"),
+      summary: z.string().optional().describe("Optional longer description explaining the rationale"),
+      proposed_by: z.string().optional().describe("Actor staging the proposal (default: Harmoni). Always forced to 'agent' actor class for security."),
+      expires_in_days: z.number().optional().describe("Days until the proposal auto-expires (default 7). Set 0 for no expiry."),
+      actions: z
+        .array(
+          z.object({
+            kind: z
+              .enum(VALID_PROPOSAL_ACTION_KINDS)
+              .describe("Action kind"),
+            payload: z
+              .record(z.string(), z.any())
+              .describe("Action-specific payload. Examples: create_item={project_id, title, description?, ...}; update_item={item_id, title?, description?, priority?, ...}; change_state={item_id, state, comment?}; add_link={from_item_id, to_item_id, relation, note?}; remove_link={from_item_id, to_item_id, relation}; merge_items={target_id, source_ids[], strategy?, ...}; split_item={source_id, splits[]}; bulk_update={item_ids[], patch}."),
+            rationale: z.string().optional().describe("Why this specific action is recommended"),
+          }),
+        )
+        .min(1)
+        .describe("Actions to stage (at least one)"),
+    },
+    async (args) => {
+      try {
+        const result = createProposal({
+          title: args.title,
+          summary: args.summary ?? null,
+          proposed_by: args.proposed_by || "Harmoni",
+          expires_in_days: args.expires_in_days,
+          actions: args.actions.map((a) => ({
+            kind: a.kind as ProposalActionKind,
+            payload: a.payload,
+            rationale: a.rationale ?? null,
+          })),
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (e) {
+        return {
+          content: [
+            { type: "text", text: `Error: ${e instanceof Error ? e.message : "Failed to create proposal"}` },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "tracker_apply_proposal",
+    "Apply accepted actions from a proposal. Routes each action through the appropriate mutator (createWorkItem, updateWorkItem, mergeItems, etc.), preserving all existing actor-class rules at the mutator boundary. SECURITY: Only human-class actors can apply proposals — agent/system/api callers will be rejected. Re-applying is idempotent: already-applied actions are skipped. Returns {applied_count, failed_count, skipped_count, actions[], proposal_status}.",
+    {
+      proposal_id: z.string().describe("Proposal ID to apply"),
+      action_ids: z
+        .array(z.string())
+        .optional()
+        .describe("Optional: apply only these specific actions. If omitted, applies all accepted actions."),
+      actor: z
+        .string()
+        .describe("Human actor applying the proposal (e.g. 'dashboard', 'me'). Must classify as 'human'."),
+    },
+    async (args) => {
+      try {
+        const result = applyProposal({
+          proposal_id: args.proposal_id,
+          action_ids: args.action_ids,
+          actor: args.actor,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (e) {
+        return {
+          content: [
+            { type: "text", text: `Error: ${e instanceof Error ? e.message : "Failed to apply proposal"}` },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "tracker_list_proposals",
+    "List staged proposals with optional filters (status, since). Use this to find pending proposals awaiting review. Returns {proposals[], stats}.",
+    {
+      status: z.enum(["pending", "partially_applied", "applied", "rejected", "expired"]).optional().describe("Filter by proposal status"),
+      since: z.string().optional().describe("Only proposals created after this ISO timestamp"),
+      limit: z.number().optional().describe("Max proposals to return (default 100, max 500)"),
+    },
+    async (args) => {
+      const items = listProposals({
+        status: args.status,
+        since: args.since,
+        limit: args.limit,
+      });
+      return {
+        content: [
+          { type: "text", text: JSON.stringify({ proposals: items, stats: getProposalStats() }, null, 2) },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "tracker_get_proposal",
+    "Get full details for a proposal including all actions.",
+    {
+      proposal_id: z.string().describe("Proposal ID"),
+    },
+    async (args) => {
+      const proposal = getProposal(args.proposal_id);
+      if (!proposal) {
+        return { content: [{ type: "text", text: "Proposal not found" }], isError: true };
+      }
+      const actions = getProposalActions(args.proposal_id);
+      return { content: [{ type: "text", text: JSON.stringify({ proposal, actions }, null, 2) }] };
     },
   );
 

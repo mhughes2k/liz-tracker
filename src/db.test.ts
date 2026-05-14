@@ -69,6 +69,16 @@ import {
   getSetting,
   setSetting,
   getAllSettings,
+  createProposal,
+  getProposal,
+  getProposalActions,
+  listProposals,
+  setProposalActionStatus,
+  rejectProposal,
+  applyProposal,
+  expireOverdueProposals,
+  getProposalStats,
+  _setProposalExpiresAtForTest,
   VALID_STATES,
   VALID_PRIORITIES,
 } from './db.js';
@@ -3441,5 +3451,274 @@ describe('bulkUpdate (TRACK-282)', () => {
     });
     const entries = listActivity({ action: 'items.bulk_updated' });
     expect(entries.length).toBeGreaterThan(0);
+  });
+});
+
+// ── Proposals (TRACK-284) ─────────────────────────────────────────────────────
+
+describe('Proposals (TRACK-284)', () => {
+  let projectId: string;
+
+  beforeEach(() => {
+    _initTestTrackerDatabase();
+    const p = createProject({ name: 'Prop Test', short_name: 'PT' });
+    projectId = p.id;
+  });
+
+  it('creates a proposal with multiple actions', () => {
+    const a = createWorkItem({ project_id: projectId, title: 'A' });
+    const result = createProposal({
+      title: 'Tidy up',
+      summary: 'Clean up labels',
+      proposed_by: 'Harmoni',
+      actions: [
+        {
+          kind: 'update_item',
+          payload: { item_id: a.id, priority: 'high' },
+          rationale: 'High urgency',
+        },
+        {
+          kind: 'bulk_update',
+          payload: { item_ids: [a.id], patch: { labels: { add: ['triaged'] } } },
+        },
+      ],
+    });
+    expect(result.proposal.status).toBe('pending');
+    expect(result.proposal.proposed_by_class).toBe('agent');
+    expect(result.actions.length).toBe(2);
+    expect(result.actions[0].ordinal).toBe(0);
+    expect(result.actions[1].ordinal).toBe(1);
+  });
+
+  it('rejects unknown action kind', () => {
+    expect(() =>
+      createProposal({
+        title: 'bad',
+        proposed_by: 'Harmoni',
+        actions: [{ kind: 'launch_nukes', payload: {} }],
+      }),
+    ).toThrow(/Invalid action kind/);
+  });
+
+  it('rejects empty actions array', () => {
+    expect(() =>
+      createProposal({ title: 'empty', proposed_by: 'Harmoni', actions: [] }),
+    ).toThrow();
+  });
+
+  it('only allows human actors to apply', () => {
+    const a = createWorkItem({ project_id: projectId, title: 'A' });
+    const { proposal, actions } = createProposal({
+      title: 't',
+      proposed_by: 'Harmoni',
+      actions: [{ kind: 'update_item', payload: { item_id: a.id, priority: 'high' } }],
+    });
+    setProposalActionStatus({ action_id: actions[0].id, status: 'accepted', actor: 'dashboard' });
+    expect(() => applyProposal({ proposal_id: proposal.id, actor: 'Harmoni' })).toThrow(/human/);
+    expect(() => applyProposal({ proposal_id: proposal.id, actor: 'orchestrator' })).toThrow(/human/);
+  });
+
+  it('applies accepted actions only', () => {
+    const a = createWorkItem({ project_id: projectId, title: 'A' });
+    const b = createWorkItem({ project_id: projectId, title: 'B' });
+    const { proposal, actions } = createProposal({
+      title: 'mixed',
+      proposed_by: 'Harmoni',
+      actions: [
+        { kind: 'update_item', payload: { item_id: a.id, priority: 'high' } },
+        { kind: 'update_item', payload: { item_id: b.id, priority: 'urgent' } },
+      ],
+    });
+    // Accept only the first
+    setProposalActionStatus({ action_id: actions[0].id, status: 'accepted', actor: 'dashboard' });
+    const result = applyProposal({ proposal_id: proposal.id, actor: 'dashboard' });
+    expect(result.applied_count).toBe(1);
+    expect(result.failed_count).toBe(0);
+    expect(getWorkItem(a.id)!.priority).toBe('high');
+    expect(getWorkItem(b.id)!.priority).not.toBe('urgent');
+    // Proposal is partially_applied because one action ran but the other is still pending
+    expect(result.proposal_status).toBe('partially_applied');
+  });
+
+  it('routes to mutators and preserves agent-cannot-approve rule', () => {
+    const a = createWorkItem({ project_id: projectId, title: 'A', requires_code: true });
+    const { proposal, actions } = createProposal({
+      title: 'try to approve',
+      proposed_by: 'Harmoni',
+      actions: [
+        { kind: 'change_state', payload: { item_id: a.id, state: 'brainstorming' } },
+        { kind: 'change_state', payload: { item_id: a.id, state: 'approved' } },
+      ],
+    });
+    setProposalActionStatus({ action_id: actions[0].id, status: 'accepted', actor: 'dashboard' });
+    setProposalActionStatus({ action_id: actions[1].id, status: 'accepted', actor: 'dashboard' });
+    // applyProposal uses actor='dashboard' (human) so changeWorkItemState will allow approval
+    const result = applyProposal({ proposal_id: proposal.id, actor: 'dashboard' });
+    expect(result.applied_count).toBe(2);
+    expect(getWorkItem(a.id)!.state).toBe('approved');
+  });
+
+  it('captures per-action errors without aborting the batch', () => {
+    const a = createWorkItem({ project_id: projectId, title: 'A' });
+    const { proposal, actions } = createProposal({
+      title: 'partial',
+      proposed_by: 'Harmoni',
+      actions: [
+        { kind: 'update_item', payload: { item_id: a.id, priority: 'high' } },
+        { kind: 'update_item', payload: { item_id: 'NONEXISTENT-9999', priority: 'high' } },
+      ],
+    });
+    setProposalActionStatus({ action_id: actions[0].id, status: 'accepted', actor: 'dashboard' });
+    setProposalActionStatus({ action_id: actions[1].id, status: 'accepted', actor: 'dashboard' });
+    const result = applyProposal({ proposal_id: proposal.id, actor: 'dashboard' });
+    expect(result.applied_count).toBe(1);
+    expect(result.failed_count).toBe(1);
+    expect(result.proposal_status).toBe('partially_applied');
+    expect(getWorkItem(a.id)!.priority).toBe('high');
+  });
+
+  it('is idempotent on re-apply (skips already-applied actions)', () => {
+    const a = createWorkItem({ project_id: projectId, title: 'A' });
+    const { proposal, actions } = createProposal({
+      title: 'idem',
+      proposed_by: 'Harmoni',
+      actions: [{ kind: 'update_item', payload: { item_id: a.id, priority: 'high' } }],
+    });
+    setProposalActionStatus({ action_id: actions[0].id, status: 'accepted', actor: 'dashboard' });
+    const first = applyProposal({ proposal_id: proposal.id, actor: 'dashboard' });
+    expect(first.applied_count).toBe(1);
+    const second = applyProposal({
+      proposal_id: proposal.id,
+      action_ids: [actions[0].id],
+      actor: 'dashboard',
+    });
+    expect(second.applied_count).toBe(0);
+    expect(second.skipped_count).toBe(1);
+  });
+
+  it('rejects a proposal and cancels remaining actions', () => {
+    const a = createWorkItem({ project_id: projectId, title: 'A' });
+    const { proposal } = createProposal({
+      title: 'rej',
+      proposed_by: 'Harmoni',
+      actions: [{ kind: 'update_item', payload: { item_id: a.id, priority: 'high' } }],
+    });
+    rejectProposal({ proposal_id: proposal.id, actor: 'dashboard' });
+    const after = getProposal(proposal.id);
+    expect(after!.status).toBe('rejected');
+    const actions = getProposalActions(proposal.id);
+    expect(actions[0].status).toBe('rejected');
+  });
+
+  it('cannot apply a rejected proposal', () => {
+    const a = createWorkItem({ project_id: projectId, title: 'A' });
+    const { proposal } = createProposal({
+      title: 'rej',
+      proposed_by: 'Harmoni',
+      actions: [{ kind: 'update_item', payload: { item_id: a.id, priority: 'high' } }],
+    });
+    rejectProposal({ proposal_id: proposal.id, actor: 'dashboard' });
+    expect(() => applyProposal({ proposal_id: proposal.id, actor: 'dashboard' })).toThrow(/rejected/);
+  });
+
+  it('expires overdue proposals via expireOverdueProposals()', () => {
+    const a = createWorkItem({ project_id: projectId, title: 'A' });
+    const { proposal } = createProposal({
+      title: 'old',
+      proposed_by: 'Harmoni',
+      actions: [{ kind: 'update_item', payload: { item_id: a.id, priority: 'high' } }],
+    });
+    _setProposalExpiresAtForTest(proposal.id, '2020-01-01T00:00:00.000Z');
+    const expired = expireOverdueProposals();
+    expect(expired).toContain(proposal.id);
+    expect(getProposal(proposal.id)!.status).toBe('expired');
+  });
+
+  it('does not expire proposals with expires_at in the future', () => {
+    const a = createWorkItem({ project_id: projectId, title: 'A' });
+    const { proposal } = createProposal({
+      title: 'fresh',
+      proposed_by: 'Harmoni',
+      expires_in_days: 7,
+      actions: [{ kind: 'update_item', payload: { item_id: a.id, priority: 'high' } }],
+    });
+    const expired = expireOverdueProposals();
+    expect(expired).not.toContain(proposal.id);
+    expect(getProposal(proposal.id)!.status).toBe('pending');
+  });
+
+  it('does not expire applied or rejected proposals', () => {
+    const a = createWorkItem({ project_id: projectId, title: 'A' });
+    const { proposal, actions } = createProposal({
+      title: 'done',
+      proposed_by: 'Harmoni',
+      actions: [{ kind: 'update_item', payload: { item_id: a.id, priority: 'high' } }],
+    });
+    setProposalActionStatus({ action_id: actions[0].id, status: 'accepted', actor: 'dashboard' });
+    applyProposal({ proposal_id: proposal.id, actor: 'dashboard' });
+    _setProposalExpiresAtForTest(proposal.id, '2020-01-01T00:00:00.000Z');
+    const expired = expireOverdueProposals();
+    expect(expired).not.toContain(proposal.id);
+    expect(getProposal(proposal.id)!.status).toBe('applied');
+  });
+
+  it('lists proposals with status filter and exposes stats', () => {
+    const a = createWorkItem({ project_id: projectId, title: 'A' });
+    const p1 = createProposal({
+      title: 'p1',
+      proposed_by: 'Harmoni',
+      actions: [{ kind: 'update_item', payload: { item_id: a.id, priority: 'high' } }],
+    });
+    rejectProposal({ proposal_id: p1.proposal.id, actor: 'dashboard' });
+    createProposal({
+      title: 'p2',
+      proposed_by: 'Harmoni',
+      actions: [{ kind: 'update_item', payload: { item_id: a.id, priority: 'urgent' } }],
+    });
+    const pending = listProposals({ status: 'pending' });
+    expect(pending.length).toBe(1);
+    expect(pending[0].title).toBe('p2');
+    const rejected = listProposals({ status: 'rejected' });
+    expect(rejected.length).toBe(1);
+    const stats = getProposalStats();
+    expect(stats.pending).toBe(1);
+    expect(stats.rejected).toBe(1);
+    expect(stats.total).toBe(2);
+  });
+
+  it('records activity log entries for create, reject and apply', () => {
+    const a = createWorkItem({ project_id: projectId, title: 'A' });
+    const { proposal, actions } = createProposal({
+      title: 'audit',
+      proposed_by: 'Harmoni',
+      actions: [{ kind: 'update_item', payload: { item_id: a.id, priority: 'high' } }],
+    });
+    setProposalActionStatus({ action_id: actions[0].id, status: 'accepted', actor: 'dashboard' });
+    applyProposal({ proposal_id: proposal.id, actor: 'dashboard' });
+    const created = listActivity({ action: 'proposal.created' });
+    const applied = listActivity({ action: 'proposal.applied' });
+    expect(created.length).toBeGreaterThan(0);
+    expect(applied.length).toBeGreaterThan(0);
+  });
+
+  it('applies add_link with source="proposal"', () => {
+    const a = createWorkItem({ project_id: projectId, title: 'A' });
+    const b = createWorkItem({ project_id: projectId, title: 'B' });
+    const { proposal, actions } = createProposal({
+      title: 'link',
+      proposed_by: 'Harmoni',
+      actions: [
+        {
+          kind: 'add_link',
+          payload: { from_item_id: a.id, to_item_id: b.id, relation: 'relates_to' },
+        },
+      ],
+    });
+    setProposalActionStatus({ action_id: actions[0].id, status: 'accepted', actor: 'dashboard' });
+    const result = applyProposal({ proposal_id: proposal.id, actor: 'dashboard' });
+    expect(result.applied_count).toBe(1);
+    const links = listLinks(a.id);
+    const proposalLink = links.find((l) => l.source === 'proposal');
+    expect(proposalLink).toBeDefined();
   });
 });

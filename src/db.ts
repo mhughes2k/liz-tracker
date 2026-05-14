@@ -191,6 +191,7 @@ export const VALID_LINK_SOURCES = [
   "merge",
   "embedding",
   "batch",
+  "proposal",
 ] as const;
 export type LinkSource = (typeof VALID_LINK_SOURCES)[number];
 
@@ -515,6 +516,39 @@ function createSchema(database: Database.Database): void {
       FOREIGN KEY (item_id) REFERENCES tracker_work_items(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_embedding_clusters_item ON tracker_embedding_clusters(item_id);
+
+    -- TRACK-284: Batch proposals. Harmoni stages a multi-action batch and a
+    -- human reviews + applies it. The applying step routes through the normal
+    -- mutators so actor-class and approval-provenance rules still hold; this
+    -- table just stores the pending plan and per-action results.
+    CREATE TABLE IF NOT EXISTS tracker_proposals (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      summary TEXT,
+      proposed_by TEXT NOT NULL,
+      proposed_by_class TEXT NOT NULL,
+      status TEXT NOT NULL,
+      expires_at TEXT,
+      created_at TEXT NOT NULL,
+      applied_at TEXT,
+      applied_by TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_proposals_status ON tracker_proposals(status);
+    CREATE INDEX IF NOT EXISTS idx_proposals_expires ON tracker_proposals(expires_at);
+
+    CREATE TABLE IF NOT EXISTS tracker_proposal_actions (
+      id TEXT PRIMARY KEY,
+      proposal_id TEXT NOT NULL,
+      ordinal INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      rationale TEXT,
+      status TEXT NOT NULL,
+      result_json TEXT,
+      applied_at TEXT,
+      FOREIGN KEY (proposal_id) REFERENCES tracker_proposals(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_proposal_actions_proposal ON tracker_proposal_actions(proposal_id);
   `);
 }
 
@@ -1212,6 +1246,36 @@ export function _initTestTrackerDatabase(): void {
       FOREIGN KEY (item_id) REFERENCES tracker_work_items(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_embedding_clusters_item ON tracker_embedding_clusters(item_id);
+
+    -- TRACK-284: proposals (test DB mirror — see canonical block above).
+    CREATE TABLE IF NOT EXISTS tracker_proposals (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      summary TEXT,
+      proposed_by TEXT NOT NULL,
+      proposed_by_class TEXT NOT NULL,
+      status TEXT NOT NULL,
+      expires_at TEXT,
+      created_at TEXT NOT NULL,
+      applied_at TEXT,
+      applied_by TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_proposals_status ON tracker_proposals(status);
+    CREATE INDEX IF NOT EXISTS idx_proposals_expires ON tracker_proposals(expires_at);
+
+    CREATE TABLE IF NOT EXISTS tracker_proposal_actions (
+      id TEXT PRIMARY KEY,
+      proposal_id TEXT NOT NULL,
+      ordinal INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      rationale TEXT,
+      status TEXT NOT NULL,
+      result_json TEXT,
+      applied_at TEXT,
+      FOREIGN KEY (proposal_id) REFERENCES tracker_proposals(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_proposal_actions_proposal ON tracker_proposal_actions(proposal_id);
   `);
 }
 
@@ -5340,4 +5404,746 @@ export function getEmbeddingStatus(): {
     clusters: cl.c,
     last_neighbour_run: last || null,
   };
+}
+
+// ── Proposals (TRACK-284) ──
+
+export const VALID_PROPOSAL_STATUSES = [
+  "pending",
+  "partially_applied",
+  "applied",
+  "rejected",
+  "expired",
+] as const;
+export type ProposalStatus = (typeof VALID_PROPOSAL_STATUSES)[number];
+
+export const VALID_PROPOSAL_ACTION_KINDS = [
+  "create_item",
+  "update_item",
+  "add_link",
+  "remove_link",
+  "merge_items",
+  "split_item",
+  "bulk_update",
+  "change_state",
+] as const;
+export type ProposalActionKind = (typeof VALID_PROPOSAL_ACTION_KINDS)[number];
+
+export const VALID_PROPOSAL_ACTION_STATUSES = [
+  "pending",
+  "accepted",
+  "rejected",
+  "applied",
+  "failed",
+] as const;
+export type ProposalActionStatus = (typeof VALID_PROPOSAL_ACTION_STATUSES)[number];
+
+export interface Proposal {
+  id: string;
+  title: string;
+  summary: string | null;
+  proposed_by: string;
+  proposed_by_class: ActorClass;
+  status: ProposalStatus;
+  expires_at: string | null;
+  created_at: string;
+  applied_at: string | null;
+  applied_by: string | null;
+}
+
+export interface ProposalAction {
+  id: string;
+  proposal_id: string;
+  ordinal: number;
+  kind: ProposalActionKind;
+  payload: Record<string, unknown>;
+  rationale: string | null;
+  status: ProposalActionStatus;
+  result: Record<string, unknown> | null;
+  applied_at: string | null;
+}
+
+interface ProposalActionRow {
+  id: string;
+  proposal_id: string;
+  ordinal: number;
+  kind: string;
+  payload_json: string;
+  rationale: string | null;
+  status: string;
+  result_json: string | null;
+  applied_at: string | null;
+}
+
+function rowToProposalAction(row: ProposalActionRow): ProposalAction {
+  let payload: Record<string, unknown> = {};
+  try {
+    payload = row.payload_json ? JSON.parse(row.payload_json) : {};
+  } catch {
+    payload = { _parse_error: row.payload_json };
+  }
+  let result: Record<string, unknown> | null = null;
+  if (row.result_json) {
+    try {
+      result = JSON.parse(row.result_json);
+    } catch {
+      result = { _parse_error: row.result_json };
+    }
+  }
+  return {
+    id: row.id,
+    proposal_id: row.proposal_id,
+    ordinal: row.ordinal,
+    kind: row.kind as ProposalActionKind,
+    payload,
+    rationale: row.rationale,
+    status: row.status as ProposalActionStatus,
+    result,
+    applied_at: row.applied_at,
+  };
+}
+
+/**
+ * Stage a batch proposal. Does NOT apply any actions — only records the plan
+ * for a human to review later. Anyone (agents, humans, system) can propose;
+ * applying is gated separately.
+ */
+export function createProposal(args: {
+  title: string;
+  summary?: string | null;
+  proposed_by: string;
+  expires_in_days?: number;
+  actions: Array<{
+    kind: ProposalActionKind | string;
+    payload: Record<string, unknown>;
+    rationale?: string | null;
+  }>;
+}): { proposal: Proposal; actions: ProposalAction[] } {
+  const title = (args.title || "").trim();
+  if (!title) throw new Error("title is required");
+  if (!Array.isArray(args.actions) || args.actions.length === 0) {
+    throw new Error("At least one action is required");
+  }
+  for (const a of args.actions) {
+    if (!a.kind || !VALID_PROPOSAL_ACTION_KINDS.includes(a.kind as ProposalActionKind)) {
+      throw new Error(
+        `Invalid action kind "${a.kind}". Valid: ${VALID_PROPOSAL_ACTION_KINDS.join(", ")}`,
+      );
+    }
+    if (!a.payload || typeof a.payload !== "object") {
+      throw new Error(`Action ${a.kind} requires a payload object`);
+    }
+  }
+
+  const proposedBy = args.proposed_by || "Harmoni";
+  const proposedByClass = classifyActor(proposedBy);
+  const ts = now();
+  const days = args.expires_in_days ?? 7;
+  const expiresAt = days > 0
+    ? new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString()
+    : null;
+
+  const proposal: Proposal = {
+    id: genId(),
+    title,
+    summary: args.summary ?? null,
+    proposed_by: proposedBy,
+    proposed_by_class: proposedByClass,
+    status: "pending",
+    expires_at: expiresAt,
+    created_at: ts,
+    applied_at: null,
+    applied_by: null,
+  };
+
+  const actions: ProposalAction[] = [];
+
+  const tx = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO tracker_proposals (id, title, summary, proposed_by, proposed_by_class, status, expires_at, created_at, applied_at, applied_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      proposal.id,
+      proposal.title,
+      proposal.summary,
+      proposal.proposed_by,
+      proposal.proposed_by_class,
+      proposal.status,
+      proposal.expires_at,
+      proposal.created_at,
+      proposal.applied_at,
+      proposal.applied_by,
+    );
+
+    const insertAction = db.prepare(
+      `INSERT INTO tracker_proposal_actions (id, proposal_id, ordinal, kind, payload_json, rationale, status, result_json, applied_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    for (let i = 0; i < args.actions.length; i++) {
+      const spec = args.actions[i];
+      const action: ProposalAction = {
+        id: genId(),
+        proposal_id: proposal.id,
+        ordinal: i,
+        kind: spec.kind as ProposalActionKind,
+        payload: spec.payload,
+        rationale: spec.rationale ?? null,
+        status: "pending",
+        result: null,
+        applied_at: null,
+      };
+      insertAction.run(
+        action.id,
+        action.proposal_id,
+        action.ordinal,
+        action.kind,
+        JSON.stringify(action.payload),
+        action.rationale,
+        action.status,
+        null,
+        null,
+      );
+      actions.push(action);
+    }
+  });
+  tx();
+
+  logActivity({
+    project_id: null,
+    item_id: null,
+    action: "proposal.created",
+    actor: proposedBy,
+    summary: `Proposed "${title}" with ${args.actions.length} action${args.actions.length === 1 ? "" : "s"}`,
+    details: {
+      proposal_id: proposal.id,
+      action_count: args.actions.length,
+      kinds: args.actions.map((a) => a.kind),
+      expires_at: expiresAt,
+    },
+  });
+
+  return { proposal, actions };
+}
+
+export function getProposal(id: string): Proposal | undefined {
+  const row = db
+    .prepare("SELECT * FROM tracker_proposals WHERE id = ?")
+    .get(id) as Proposal | undefined;
+  return row;
+}
+
+export function getProposalActions(proposalId: string): ProposalAction[] {
+  const rows = db
+    .prepare(
+      "SELECT * FROM tracker_proposal_actions WHERE proposal_id = ? ORDER BY ordinal ASC",
+    )
+    .all(proposalId) as ProposalActionRow[];
+  return rows.map(rowToProposalAction);
+}
+
+export function getProposalAction(actionId: string): ProposalAction | undefined {
+  const row = db
+    .prepare("SELECT * FROM tracker_proposal_actions WHERE id = ?")
+    .get(actionId) as ProposalActionRow | undefined;
+  return row ? rowToProposalAction(row) : undefined;
+}
+
+export function listProposals(filters?: {
+  status?: ProposalStatus | string;
+  since?: string;
+  limit?: number;
+  offset?: number;
+}): Proposal[] {
+  const where: string[] = [];
+  const values: unknown[] = [];
+  if (filters?.status) {
+    where.push("status = ?");
+    values.push(filters.status);
+  }
+  if (filters?.since) {
+    where.push("created_at >= ?");
+    values.push(filters.since);
+  }
+  const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+  const limit = Math.min(Math.max(filters?.limit ?? 100, 1), 500);
+  const offset = Math.max(filters?.offset ?? 0, 0);
+  values.push(limit, offset);
+  const rows = db
+    .prepare(
+      `SELECT * FROM tracker_proposals ${whereSql} ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+    )
+    .all(...values) as Proposal[];
+  return rows;
+}
+
+/**
+ * Set the status of a single action within a proposal (accepted / rejected /
+ * back to pending). Does NOT apply the action — applying happens via
+ * applyProposal().
+ *
+ * Returns the updated action or undefined if not found.
+ */
+export function setProposalActionStatus(args: {
+  action_id: string;
+  status: "accepted" | "rejected" | "pending";
+  actor: string;
+}): ProposalAction | undefined {
+  const existing = getProposalAction(args.action_id);
+  if (!existing) return undefined;
+  if (existing.status === "applied" || existing.status === "failed") {
+    throw new Error(
+      `Cannot change status of action ${args.action_id} — it is already ${existing.status}`,
+    );
+  }
+  db.prepare(
+    "UPDATE tracker_proposal_actions SET status = ? WHERE id = ?",
+  ).run(args.status, args.action_id);
+  return getProposalAction(args.action_id);
+}
+
+/**
+ * Mark a proposal rejected (cancels all pending/accepted actions).
+ * Applied/failed actions are left alone (they represent history).
+ */
+export function rejectProposal(args: { proposal_id: string; actor: string }): Proposal | undefined {
+  const proposal = getProposal(args.proposal_id);
+  if (!proposal) return undefined;
+  if (proposal.status === "applied" || proposal.status === "rejected" || proposal.status === "expired") {
+    return proposal;
+  }
+  const tx = db.transaction(() => {
+    db.prepare("UPDATE tracker_proposals SET status = 'rejected' WHERE id = ?").run(args.proposal_id);
+    db.prepare(
+      "UPDATE tracker_proposal_actions SET status = 'rejected' WHERE proposal_id = ? AND status IN ('pending', 'accepted')",
+    ).run(args.proposal_id);
+  });
+  tx();
+  logActivity({
+    project_id: null,
+    item_id: null,
+    action: "proposal.rejected",
+    actor: args.actor,
+    summary: `Rejected proposal "${proposal.title}"`,
+    details: { proposal_id: args.proposal_id },
+  });
+  return getProposal(args.proposal_id);
+}
+
+/**
+ * Mark a proposal expired. Pending/accepted actions are flipped to rejected
+ * so the audit trail records they were never applied.
+ */
+export function expireProposal(proposalId: string): Proposal | undefined {
+  const proposal = getProposal(proposalId);
+  if (!proposal) return undefined;
+  if (proposal.status !== "pending" && proposal.status !== "partially_applied") {
+    return proposal;
+  }
+  const tx = db.transaction(() => {
+    db.prepare("UPDATE tracker_proposals SET status = 'expired' WHERE id = ?").run(proposalId);
+    db.prepare(
+      "UPDATE tracker_proposal_actions SET status = 'rejected' WHERE proposal_id = ? AND status IN ('pending', 'accepted')",
+    ).run(proposalId);
+  });
+  tx();
+  logActivity({
+    project_id: null,
+    item_id: null,
+    action: "proposal.expired",
+    actor: "system",
+    summary: `Proposal "${proposal.title}" expired`,
+    details: { proposal_id: proposalId, expires_at: proposal.expires_at },
+  });
+  return getProposal(proposalId);
+}
+
+/**
+ * Test-only: directly set a proposal's expires_at value. Used by the test
+ * suite to simulate the passage of time without sleeping.
+ */
+export function _setProposalExpiresAtForTest(
+  proposalId: string,
+  expiresAt: string | null,
+): void {
+  db.prepare("UPDATE tracker_proposals SET expires_at = ? WHERE id = ?").run(
+    expiresAt,
+    proposalId,
+  );
+}
+
+/**
+ * Sweep for proposals past their expiry date and mark them expired.
+ * Called periodically by the orchestrator.
+ */
+export function expireOverdueProposals(): string[] {
+  const ts = now();
+  const rows = db
+    .prepare(
+      `SELECT id FROM tracker_proposals
+       WHERE status IN ('pending', 'partially_applied')
+         AND expires_at IS NOT NULL
+         AND expires_at < ?`,
+    )
+    .all(ts) as Array<{ id: string }>;
+  const expired: string[] = [];
+  for (const r of rows) {
+    expireProposal(r.id);
+    expired.push(r.id);
+  }
+  return expired;
+}
+
+export interface ProposalActionApplyResult {
+  action_id: string;
+  ordinal: number;
+  kind: ProposalActionKind;
+  status: "applied" | "failed" | "skipped";
+  result?: Record<string, unknown> | null;
+  error?: string;
+}
+
+export interface ProposalApplyResult {
+  proposal_id: string;
+  applied_count: number;
+  failed_count: number;
+  skipped_count: number;
+  actions: ProposalActionApplyResult[];
+  proposal_status: ProposalStatus;
+}
+
+/**
+ * Resolve a possible display key (e.g. "TRACK-5") to a raw work item ID.
+ * Falls back to the original string if no key match — caller will get
+ * "not found" from the downstream mutator if it isn't a real ID either.
+ */
+function resolveItemIdOrKey(idOrKey: unknown): string {
+  if (typeof idOrKey !== "string") return String(idOrKey ?? "");
+  if (/^[A-Za-z]+-\d+$/.test(idOrKey)) {
+    const item = getWorkItemByKey(idOrKey);
+    if (item) return item.id;
+  }
+  return idOrKey;
+}
+
+/**
+ * Apply accepted actions of a proposal in ordinal order. Each action runs in
+ * its own transaction (via the underlying mutator's transaction or a fresh
+ * one for create_item) so a single failure does not poison subsequent ones.
+ *
+ * Security:
+ *  - Caller (the apply REST endpoint or MCP tool) is responsible for verifying
+ *    the actor is human-class. This function rejects non-human actors when
+ *    the proposal contains any action that could grant code execution.
+ *  - Individual mutators still apply their own actor-class rules — e.g.
+ *    change_state to "approved" still requires a human actor, and the actor
+ *    string passed here is what they see.
+ *  - Idempotent: actions already in 'applied' status are skipped silently.
+ */
+export function applyProposal(args: {
+  proposal_id: string;
+  action_ids?: string[];
+  actor: string;
+}): ProposalApplyResult {
+  const proposal = getProposal(args.proposal_id);
+  if (!proposal) throw new Error("proposal_id not found");
+  if (proposal.status === "rejected" || proposal.status === "expired") {
+    throw new Error(`Cannot apply proposal in status "${proposal.status}"`);
+  }
+
+  const actor = args.actor || "";
+  if (!actor.trim()) throw new Error("actor is required");
+  const actorClass = classifyActor(actor);
+  if (actorClass !== "human") {
+    throw new Error(
+      `Only human actors can apply proposals. Actor "${actor}" classified as "${actorClass}". ` +
+      `Agents can stage proposals but applying requires human review.`,
+    );
+  }
+
+  const allActions = getProposalActions(args.proposal_id);
+  const idFilter = args.action_ids && args.action_ids.length > 0
+    ? new Set(args.action_ids)
+    : null;
+
+  const ts = now();
+  const results: ProposalActionApplyResult[] = [];
+  let appliedCount = 0;
+  let failedCount = 0;
+  let skippedCount = 0;
+
+  for (const action of allActions) {
+    if (idFilter && !idFilter.has(action.id)) continue;
+    if (action.status === "applied") {
+      // Idempotent re-apply: skip silently with prior result.
+      results.push({
+        action_id: action.id,
+        ordinal: action.ordinal,
+        kind: action.kind,
+        status: "skipped",
+        result: action.result,
+      });
+      skippedCount++;
+      continue;
+    }
+    if (action.status !== "accepted" && !idFilter) {
+      // No filter means "apply all accepted" — skip pending/rejected/failed.
+      continue;
+    }
+    if (idFilter && (action.status === "rejected" || action.status === "failed")) {
+      results.push({
+        action_id: action.id,
+        ordinal: action.ordinal,
+        kind: action.kind,
+        status: "skipped",
+        error: `action status is "${action.status}"`,
+      });
+      skippedCount++;
+      continue;
+    }
+
+    try {
+      const result = executeProposalAction(action, actor);
+      db.prepare(
+        "UPDATE tracker_proposal_actions SET status = 'applied', result_json = ?, applied_at = ? WHERE id = ?",
+      ).run(JSON.stringify(result), ts, action.id);
+      results.push({
+        action_id: action.id,
+        ordinal: action.ordinal,
+        kind: action.kind,
+        status: "applied",
+        result,
+      });
+      appliedCount++;
+    } catch (e) {
+      const error = e instanceof Error ? e.message : String(e);
+      db.prepare(
+        "UPDATE tracker_proposal_actions SET status = 'failed', result_json = ?, applied_at = ? WHERE id = ?",
+      ).run(JSON.stringify({ error }), ts, action.id);
+      results.push({
+        action_id: action.id,
+        ordinal: action.ordinal,
+        kind: action.kind,
+        status: "failed",
+        error,
+      });
+      failedCount++;
+    }
+  }
+
+  // Decide overall proposal status. Re-fetch all actions to see the global
+  // picture (some may have been applied in earlier calls).
+  const finalActions = getProposalActions(args.proposal_id);
+  const hasPendingOrAccepted = finalActions.some(
+    (a) => a.status === "pending" || a.status === "accepted",
+  );
+  const hasApplied = finalActions.some((a) => a.status === "applied");
+  const hasFailed = finalActions.some((a) => a.status === "failed");
+
+  let proposalStatus: ProposalStatus;
+  if (hasPendingOrAccepted) {
+    proposalStatus = hasApplied || hasFailed ? "partially_applied" : "pending";
+  } else if (hasApplied) {
+    proposalStatus = hasFailed ? "partially_applied" : "applied";
+  } else {
+    // Nothing applied and nothing pending — rejected (or all already failed).
+    proposalStatus = "rejected";
+  }
+
+  db.prepare(
+    "UPDATE tracker_proposals SET status = ?, applied_at = ?, applied_by = ? WHERE id = ?",
+  ).run(
+    proposalStatus,
+    proposalStatus === "applied" || proposalStatus === "partially_applied" ? ts : proposal.applied_at,
+    proposalStatus === "applied" || proposalStatus === "partially_applied" ? actor : proposal.applied_by,
+    args.proposal_id,
+  );
+
+  logActivity({
+    project_id: null,
+    item_id: null,
+    action: "proposal.applied",
+    actor,
+    summary: `Applied proposal "${proposal.title}" — ${appliedCount} ok, ${failedCount} failed, ${skippedCount} skipped`,
+    details: {
+      proposal_id: args.proposal_id,
+      applied_count: appliedCount,
+      failed_count: failedCount,
+      skipped_count: skippedCount,
+      final_status: proposalStatus,
+    },
+  });
+
+  return {
+    proposal_id: args.proposal_id,
+    applied_count: appliedCount,
+    failed_count: failedCount,
+    skipped_count: skippedCount,
+    actions: results,
+    proposal_status: proposalStatus,
+  };
+}
+
+/**
+ * Execute a single proposal action by routing to the correct underlying
+ * mutator. Throws on failure — applyProposal() captures the error per-action.
+ */
+function executeProposalAction(
+  action: ProposalAction,
+  actor: string,
+): Record<string, unknown> {
+  const p = action.payload;
+  switch (action.kind) {
+    case "create_item": {
+      if (typeof p.project_id !== "string" || !p.project_id) {
+        throw new Error("create_item requires project_id");
+      }
+      if (typeof p.title !== "string" || !p.title.trim()) {
+        throw new Error("create_item requires title");
+      }
+      const item = createWorkItem({
+        project_id: String(p.project_id),
+        title: String(p.title),
+        description: typeof p.description === "string" ? p.description : undefined,
+        state: typeof p.state === "string" ? (p.state as WorkItemState) : undefined,
+        priority: typeof p.priority === "string" ? (p.priority as Priority) : undefined,
+        assignee: typeof p.assignee === "string" ? p.assignee : undefined,
+        labels: Array.isArray(p.labels) ? (p.labels as string[]) : undefined,
+        requires_code: typeof p.requires_code === "boolean" ? p.requires_code : undefined,
+        bot_dispatch: typeof p.bot_dispatch === "boolean" ? p.bot_dispatch : undefined,
+        platform: typeof p.platform === "string" ? (p.platform as Platform) : undefined,
+        date_due: typeof p.date_due === "string" ? p.date_due : undefined,
+        link: typeof p.link === "string" ? p.link : undefined,
+        space_type: typeof p.space_type === "string" ? p.space_type : undefined,
+        space_data: typeof p.space_data === "string" ? p.space_data : undefined,
+        created_by: actor,
+      });
+      return { id: item.id, key: getWorkItemKey(item), title: item.title };
+    }
+
+    case "update_item": {
+      const id = resolveItemIdOrKey(p.item_id);
+      const result = updateWorkItem(id, {
+        title: typeof p.title === "string" ? p.title : undefined,
+        description: typeof p.description === "string" ? p.description : undefined,
+        priority: typeof p.priority === "string" ? (p.priority as Priority) : undefined,
+        assignee: typeof p.assignee === "string" ? p.assignee : undefined,
+        labels: Array.isArray(p.labels)
+          ? JSON.stringify(p.labels)
+          : typeof p.labels === "string"
+            ? p.labels
+            : undefined,
+        date_due: p.date_due === null ? null : typeof p.date_due === "string" ? p.date_due : undefined,
+        link: p.link === null ? null : typeof p.link === "string" ? p.link : undefined,
+        actor,
+      });
+      if (!result) throw new Error("item not found");
+      return { id: result.id, key: getWorkItemKey(result) };
+    }
+
+    case "change_state": {
+      const id = resolveItemIdOrKey(p.item_id);
+      const state = p.state as WorkItemState;
+      if (!VALID_STATES.includes(state)) {
+        throw new Error(`Invalid state "${state}"`);
+      }
+      const result = changeWorkItemState(
+        id,
+        state,
+        actor,
+        typeof p.comment === "string" ? p.comment : undefined,
+      );
+      if (!result) throw new Error("item not found");
+      return { id: result.id, key: getWorkItemKey(result), state: result.state };
+    }
+
+    case "add_link": {
+      const fromId = resolveItemIdOrKey(p.from_item_id);
+      const toId = resolveItemIdOrKey(p.to_item_id);
+      const link = addLink({
+        from_item_id: fromId,
+        to_item_id: toId,
+        relation: String(p.relation || ""),
+        note: typeof p.note === "string" ? p.note : null,
+        source: "proposal",
+        created_by: actor,
+      });
+      return { link_id: link.id, relation: link.relation };
+    }
+
+    case "remove_link": {
+      const fromId = resolveItemIdOrKey(p.from_item_id);
+      const toId = resolveItemIdOrKey(p.to_item_id);
+      const removed = removeLink({
+        from_item_id: fromId,
+        to_item_id: toId,
+        relation: String(p.relation || ""),
+        actor,
+      });
+      return { removed };
+    }
+
+    case "merge_items": {
+      const targetId = resolveItemIdOrKey(p.target_id);
+      const sourceIds = Array.isArray(p.source_ids)
+        ? (p.source_ids as unknown[]).map(resolveItemIdOrKey)
+        : [];
+      const result = mergeItems({
+        target_id: targetId,
+        source_ids: sourceIds,
+        strategy: p.strategy as "append_descriptions" | "replace_with_summary" | undefined,
+        transfer_comments: typeof p.transfer_comments === "boolean" ? p.transfer_comments : undefined,
+        transfer_attachments: typeof p.transfer_attachments === "boolean" ? p.transfer_attachments : undefined,
+        transfer_links: typeof p.transfer_links === "boolean" ? p.transfer_links : undefined,
+        actor,
+      });
+      return result as unknown as Record<string, unknown>;
+    }
+
+    case "split_item": {
+      const sourceId = resolveItemIdOrKey(p.source_id);
+      const result = splitItem({
+        source_id: sourceId,
+        splits: (p.splits as SplitSpec[]) || [],
+        preserve_source: typeof p.preserve_source === "boolean" ? p.preserve_source : undefined,
+        actor,
+      });
+      return result as unknown as Record<string, unknown>;
+    }
+
+    case "bulk_update": {
+      const ids = Array.isArray(p.item_ids)
+        ? (p.item_ids as unknown[]).map(resolveItemIdOrKey)
+        : [];
+      const result = bulkUpdate({
+        item_ids: ids,
+        patch: (p.patch as BulkUpdatePatch) || {},
+        actor,
+      });
+      return result as unknown as Record<string, unknown>;
+    }
+
+    default: {
+      const _exhaustive: never = action.kind;
+      throw new Error(`Unknown action kind: ${String(_exhaustive)}`);
+    }
+  }
+}
+
+export function getProposalStats(): {
+  total: number;
+  pending: number;
+  partially_applied: number;
+  applied: number;
+  rejected: number;
+  expired: number;
+} {
+  const rows = db
+    .prepare("SELECT status, COUNT(*) AS c FROM tracker_proposals GROUP BY status")
+    .all() as Array<{ status: string; c: number }>;
+  const out = { total: 0, pending: 0, partially_applied: 0, applied: 0, rejected: 0, expired: 0 };
+  for (const r of rows) {
+    out.total += r.c;
+    if (r.status in out) (out as unknown as Record<string, number>)[r.status] = r.c;
+  }
+  return out;
 }

@@ -33,6 +33,7 @@ import {
   completeExecutionAudit,
   getExpiredScheduledItems,
   updateWorkItem,
+  expireOverdueProposals,
   type WorkItem,
   type Project,
   type Attachment,
@@ -1333,6 +1334,16 @@ function tick(): void {
 
   // Check for expired scheduled items and auto-close them
   checkExpiredScheduledItems();
+
+  // Expire overdue proposals (TRACK-284)
+  try {
+    const expired = expireOverdueProposals();
+    if (expired.length > 0) {
+      logger.info({ count: expired.length, ids: expired }, "Expired overdue proposals");
+    }
+  } catch (e) {
+    logger.warn({ error: e instanceof Error ? e.message : String(e) }, "Failed to expire proposals");
+  }
 
   // Check for items in testing/in_review that have been acknowledged by owner
   checkPendingAcknowledgments();

@@ -10023,6 +10023,9 @@
         <button class="today-control-btn" id="activityLogBtn" title="Activity log">
           <span class="today-btn-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></span> Activity
         </button>
+        <button class="today-control-btn" id="proposalsBtn" title="Proposals from agents">
+          <span class="today-btn-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg></span> Proposals <span id="proposalsPendingBadge" style="display:none;margin-left:4px;padding:1px 6px;border-radius:8px;background:var(--accent,#3b82f6);color:#fff;font-size:0.7rem;font-weight:600;"></span>
+        </button>
         <div style="flex: 1"></div>
         <div class="sort-control">
           <label class="sort-label" for="sortMode">Sort:</label>
@@ -10588,6 +10591,27 @@
       </div>
       <div class="activity-panel-list" id="activityList"></div>
       <button class="activity-load-more" id="activityLoadMore" style="display:none">Load more</button>
+    </div>
+
+    <!-- Proposals Panel (TRACK-284) -->
+    <div class="activity-panel-overlay" id="proposalsPanelOverlay"></div>
+    <div class="activity-panel" id="proposalsPanel">
+      <div class="activity-panel-header">
+        <h2>Proposals</h2>
+        <button class="activity-panel-refresh" id="proposalsRefreshBtn" title="Refresh">&#8635;</button>
+        <button class="activity-panel-close" id="proposalsCloseBtn" title="Close">&times;</button>
+      </div>
+      <div class="activity-panel-filters">
+        <select id="proposalsStatusFilter">
+          <option value="pending">Pending</option>
+          <option value="partially_applied">Partially applied</option>
+          <option value="applied">Applied</option>
+          <option value="rejected">Rejected</option>
+          <option value="expired">Expired</option>
+          <option value="">All</option>
+        </select>
+      </div>
+      <div class="activity-panel-list" id="proposalsList"></div>
     </div>
 
     <!-- Space Overlay (modal workspace for specialized item types) -->
@@ -20566,7 +20590,199 @@
           if (e.key === "Escape" && $("#activityPanel").classList.contains("open")) {
             closeActivityPanel();
           }
+          if (e.key === "Escape" && $("#proposalsPanel").classList.contains("open")) {
+            closeProposalsPanel();
+          }
         });
+
+        // ── Proposals (TRACK-284) ──
+
+        function openProposalsPanel() {
+          $("#proposalsPanel").classList.add("open");
+          $("#proposalsPanelOverlay").classList.add("open");
+          loadProposals();
+        }
+
+        function closeProposalsPanel() {
+          $("#proposalsPanel").classList.remove("open");
+          $("#proposalsPanelOverlay").classList.remove("open");
+        }
+
+        async function loadProposals() {
+          const status = $("#proposalsStatusFilter").value;
+          const params = new URLSearchParams();
+          if (status) params.set("status", status);
+          const listEl = $("#proposalsList");
+          try {
+            const data = await apiGet(`/proposals?${params}`);
+            const proposals = (data && data.proposals) || [];
+            if (proposals.length === 0) {
+              listEl.innerHTML = '<div class="activity-empty">No proposals</div>';
+              return;
+            }
+            listEl.innerHTML = proposals.map(renderProposalRow).join("");
+            updateProposalsBadge((data.stats && data.stats.pending) || 0);
+          } catch (e) {
+            listEl.innerHTML = '<div class="activity-empty">Failed to load proposals</div>';
+          }
+        }
+
+        function renderProposalRow(p) {
+          const expires = p.expires_at ? `<span style="font-size:0.75rem;color:var(--text-dim)">expires ${esc(p.expires_at.slice(0, 10))}</span>` : "";
+          const summary = p.summary ? `<div style="font-size:0.8rem;color:var(--text-dim);margin-top:2px">${esc(p.summary)}</div>` : "";
+          return `
+            <div class="proposal-row" data-id="${esc(p.id)}" style="border-bottom:1px solid var(--border);padding:10px 12px;cursor:pointer">
+              <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
+                <strong>${esc(p.title)}</strong>
+                <span class="proposal-status proposal-status-${esc(p.status)}" style="font-size:0.7rem;text-transform:uppercase;padding:2px 6px;border-radius:4px;background:var(--surface-alt);">${esc(p.status)}</span>
+              </div>
+              ${summary}
+              <div style="display:flex;gap:8px;font-size:0.75rem;color:var(--text-dim);margin-top:4px;align-items:center">
+                <span>by ${esc(p.proposed_by)}</span>
+                <span>${esc(p.created_at.slice(0, 10))}</span>
+                ${expires}
+              </div>
+            </div>
+          `;
+        }
+
+        async function openProposalDetail(proposalId) {
+          try {
+            const data = await apiGet(`/proposals/${encodeURIComponent(proposalId)}`);
+            renderProposalDetail(data.proposal, data.actions);
+          } catch (e) {
+            alert(`Failed to load proposal: ${e && e.message ? e.message : e}`);
+          }
+        }
+
+        function renderProposalDetail(proposal, actions) {
+          const listEl = $("#proposalsList");
+          const editable = proposal.status === "pending" || proposal.status === "partially_applied";
+          const actionsHtml = actions.map((a) => {
+            const payloadStr = esc(JSON.stringify(a.payload, null, 2));
+            const rat = a.rationale ? `<div style="font-size:0.78rem;color:var(--text-dim);margin-bottom:4px">${esc(a.rationale)}</div>` : "";
+            const errStr = a.result && a.result.error ? `<div style="color:#dc2626;font-size:0.78rem;margin-top:4px">${esc(a.result.error)}</div>` : "";
+            const buttons = (a.status === "pending" || a.status === "accepted") && editable ? `
+              <div style="display:flex;gap:6px;margin-top:6px">
+                ${a.status !== "accepted" ? `<button class="today-control-btn" data-action="accept" data-id="${esc(a.id)}">Accept</button>` : ""}
+                ${a.status !== "rejected" ? `<button class="today-control-btn" data-action="reject" data-id="${esc(a.id)}">Reject</button>` : ""}
+              </div>
+            ` : "";
+            return `
+              <div style="border:1px solid var(--border);border-radius:6px;padding:10px;margin-bottom:8px">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+                  <strong>${esc(a.kind)}</strong>
+                  <span style="font-size:0.7rem;text-transform:uppercase;padding:2px 6px;border-radius:4px;background:var(--surface-alt)">${esc(a.status)}</span>
+                </div>
+                ${rat}
+                <pre style="font-size:0.72rem;background:var(--surface-alt);padding:6px;border-radius:4px;overflow:auto;max-height:160px;margin:0">${payloadStr}</pre>
+                ${errStr}
+                ${buttons}
+              </div>
+            `;
+          }).join("");
+
+          const applyBtn = editable
+            ? `<button class="today-control-btn" id="proposalApplyBtn" data-id="${esc(proposal.id)}">Apply accepted actions</button>`
+            : "";
+          const rejectBtn = editable
+            ? `<button class="today-control-btn" id="proposalRejectBtn" data-id="${esc(proposal.id)}">Reject proposal</button>`
+            : "";
+
+          listEl.innerHTML = `
+            <div style="padding:12px">
+              <button class="today-control-btn" id="proposalBackBtn" style="margin-bottom:8px">&larr; Back</button>
+              <h3 style="margin:0 0 4px 0">${esc(proposal.title)}</h3>
+              <div style="font-size:0.8rem;color:var(--text-dim);margin-bottom:8px">by ${esc(proposal.proposed_by)} • status: ${esc(proposal.status)}</div>
+              ${proposal.summary ? `<p>${esc(proposal.summary)}</p>` : ""}
+              <div style="display:flex;gap:6px;margin-bottom:12px">${applyBtn}${rejectBtn}</div>
+              ${actionsHtml}
+            </div>
+          `;
+        }
+
+        function updateProposalsBadge(pendingCount) {
+          const badge = $("#proposalsPendingBadge");
+          if (!badge) return;
+          if (pendingCount > 0) {
+            badge.textContent = String(pendingCount);
+            badge.style.display = "";
+          } else {
+            badge.style.display = "none";
+          }
+        }
+
+        async function refreshProposalsBadge() {
+          try {
+            const data = await apiGet(`/proposals?status=pending&limit=1`);
+            updateProposalsBadge((data.stats && data.stats.pending) || 0);
+          } catch (e) { /* ignore */ }
+        }
+
+        // Wire up Proposals UI
+        $("#proposalsBtn").addEventListener("click", openProposalsPanel);
+        $("#proposalsCloseBtn").addEventListener("click", closeProposalsPanel);
+        $("#proposalsPanelOverlay").addEventListener("click", closeProposalsPanel);
+        $("#proposalsRefreshBtn").addEventListener("click", loadProposals);
+        $("#proposalsStatusFilter").addEventListener("change", loadProposals);
+
+        $("#proposalsList").addEventListener("click", async (e) => {
+          const target = e.target;
+          // Back to list
+          if (target.id === "proposalBackBtn") {
+            loadProposals();
+            return;
+          }
+          // Per-action accept/reject
+          const actionBtn = target.closest("[data-action]");
+          if (actionBtn) {
+            e.stopPropagation();
+            const actionId = actionBtn.dataset.id;
+            const status = actionBtn.dataset.action === "accept" ? "accepted" : "rejected";
+            const proposalCard = target.closest(".proposal-row");
+            const proposalId = $("#proposalApplyBtn") ? $("#proposalApplyBtn").dataset.id : null;
+            try {
+              await apiPatch(`/proposals/${encodeURIComponent(proposalId)}/actions/${encodeURIComponent(actionId)}`, { status, actor: "dashboard" });
+              if (proposalId) openProposalDetail(proposalId);
+            } catch (err) {
+              alert(`Failed: ${err && err.message ? err.message : err}`);
+            }
+            return;
+          }
+          // Apply proposal
+          if (target.id === "proposalApplyBtn") {
+            const proposalId = target.dataset.id;
+            if (!confirm("Apply all accepted actions in this proposal?")) return;
+            try {
+              const result = await apiPost(`/proposals/${encodeURIComponent(proposalId)}/apply`, { actor: "dashboard" });
+              alert(`Applied: ${result.applied_count}, failed: ${result.failed_count}, skipped: ${result.skipped_count}`);
+              openProposalDetail(proposalId);
+              refreshCurrentView && refreshCurrentView();
+            } catch (err) {
+              alert(`Apply failed: ${err && err.message ? err.message : err}`);
+            }
+            return;
+          }
+          // Reject proposal
+          if (target.id === "proposalRejectBtn") {
+            const proposalId = target.dataset.id;
+            if (!confirm("Reject this entire proposal?")) return;
+            try {
+              await apiDelete(`/proposals/${encodeURIComponent(proposalId)}`);
+              openProposalDetail(proposalId);
+            } catch (err) {
+              alert(`Reject failed: ${err && err.message ? err.message : err}`);
+            }
+            return;
+          }
+          // Row click → open detail
+          const row = target.closest(".proposal-row");
+          if (row) openProposalDetail(row.dataset.id);
+        });
+
+        // Refresh badge initially and every 60s
+        refreshProposalsBadge();
+        setInterval(refreshProposalsBadge, 60000);
 
         // ── Auto Refresh ──
 
