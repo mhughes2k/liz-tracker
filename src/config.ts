@@ -400,6 +400,89 @@ export const DECKWRIGHT_URL = (
   process.env.DECKWRIGHT_URL || "http://192.168.50.19:2222"
 ).replace(/\/+$/, ""); // Strip trailing slash
 
+// ── Embeddings (TRACK-283) ──
+
+/**
+ * Embedding provider for the similarity / merge-candidates / topic / drift pipeline.
+ * - "voyage"  → calls Voyage AI (https://api.voyageai.com). Requires VOYAGE_API_KEY.
+ * - "anthropic" → reserved (Anthropic does not currently ship a public embeddings
+ *   endpoint; selecting this falls back to a deterministic mock until an API exists,
+ *   so the rest of the pipeline can run end-to-end in CI without network calls).
+ * - "local"   → deterministic hash-based mock vector. No external calls. Useful for
+ *   tests, offline development, and graceful degradation when no key is configured.
+ * - "mock"    → alias for "local" (kept so older `.env` files keep working).
+ *
+ * Default is "local" (rather than "voyage") so a fresh install never requires
+ * external credentials to boot. Operators opt in to Voyage by setting both
+ * EMBEDDING_PROVIDER=voyage and VOYAGE_API_KEY.
+ */
+export type EmbeddingProvider = "voyage" | "anthropic" | "local" | "mock";
+export const EMBEDDING_PROVIDER: EmbeddingProvider = (
+  (process.env.EMBEDDING_PROVIDER as EmbeddingProvider) || "local"
+);
+
+/** Voyage API key — required when EMBEDDING_PROVIDER=voyage. */
+export const VOYAGE_API_KEY = process.env.VOYAGE_API_KEY || "";
+
+/** Voyage model identifier. voyage-3 is the current general-purpose default. */
+export const VOYAGE_MODEL = process.env.VOYAGE_MODEL || "voyage-3";
+
+/** Voyage embedding endpoint (overridable for tests / proxies). */
+export const VOYAGE_API_URL =
+  process.env.VOYAGE_API_URL || "https://api.voyageai.com/v1/embeddings";
+
+/**
+ * Cosine-similarity threshold above which two items are linked as `relates_to`
+ * with source='embedding'. The nightly neighbour computation writes these.
+ */
+export const EMBEDDING_RELATES_THRESHOLD = parseFloat(
+  process.env.EMBEDDING_RELATES_THRESHOLD || "0.85",
+);
+
+/**
+ * Cosine-similarity threshold above which a pair surfaces in the Merge
+ * Candidates view. Higher than RELATES_THRESHOLD on purpose — Merge Candidates
+ * are a much stronger claim than "these two items are related."
+ */
+export const EMBEDDING_MERGE_THRESHOLD = parseFloat(
+  process.env.EMBEDDING_MERGE_THRESHOLD || "0.92",
+);
+
+/**
+ * Drift-score threshold above which an item's title/description divergence is
+ * surfaced in the UI (badge + detail-panel banner).
+ * Drift = 1 - cosine(embed(title), embed(title + description)).
+ */
+export const EMBEDDING_DRIFT_THRESHOLD = parseFloat(
+  process.env.EMBEDDING_DRIFT_THRESHOLD || "0.35",
+);
+
+/**
+ * How long the debounced embedding worker waits after the most recent
+ * create/update before computing the embedding (milliseconds).
+ * Avoids thrashing on rapid edits.
+ */
+export const EMBEDDING_DEBOUNCE_MS = parseInt(
+  process.env.EMBEDDING_DEBOUNCE_MS || "30000",
+  10,
+);
+
+/**
+ * How often the nightly neighbour-computation job runs (milliseconds).
+ * Default 24h. The orchestrator's tick checks whether this has elapsed since
+ * the last run and triggers a recompute if so.
+ */
+export const EMBEDDING_NEIGHBOUR_INTERVAL_MS = parseInt(
+  process.env.EMBEDDING_NEIGHBOUR_INTERVAL_MS || String(24 * 60 * 60 * 1000),
+  10,
+);
+
+/** Top-K neighbours stored per item in `tracker_embedding_neighbours`. */
+export const EMBEDDING_NEIGHBOUR_K = parseInt(
+  process.env.EMBEDDING_NEIGHBOUR_K || "10",
+  10,
+);
+
 // ── AI Categorization ──
 
 /**

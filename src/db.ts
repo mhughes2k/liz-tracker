@@ -440,6 +440,81 @@ function createSchema(database: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_links_from ON tracker_links(from_item_id);
     CREATE INDEX IF NOT EXISTS idx_links_to ON tracker_links(to_item_id);
     CREATE INDEX IF NOT EXISTS idx_links_relation ON tracker_links(relation);
+
+    -- TRACK-283: Generic embeddings layer.
+    -- Keyed by source_uri (not item_id) on purpose, so other entity types
+    -- (e.g. wiki articles from LIZ-230, query expansions from LIZ-201) can
+    -- share this infrastructure without a migration. The PK is the URI;
+    -- source_kind + source_ref index by the bare ID for fast joins.
+    --
+    -- For tracker items, we store TWO entries per item:
+    --   tracker://item/{id}        — embed(title + description)
+    --   tracker://item/{id}#title  — embed(title) alone
+    -- The pair enables the Drift detector (cosine distance between them).
+    CREATE TABLE IF NOT EXISTS tracker_embeddings (
+      source_uri TEXT PRIMARY KEY,
+      source_kind TEXT NOT NULL,
+      source_ref TEXT NOT NULL,
+      text_hash TEXT NOT NULL,
+      embedding BLOB NOT NULL,
+      model TEXT NOT NULL,
+      dim INTEGER NOT NULL,
+      computed_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_embeddings_source_kind ON tracker_embeddings(source_kind);
+    CREATE INDEX IF NOT EXISTS idx_embeddings_source_ref ON tracker_embeddings(source_ref);
+
+    -- Precomputed top-K neighbours per item. Directed so we can answer
+    -- "what are X's neighbours?" with a single index lookup. The nightly job
+    -- writes pairs in both directions, so a reverse-lookup would only need
+    -- one query per item.
+    CREATE TABLE IF NOT EXISTS tracker_embedding_neighbours (
+      source_ref TEXT NOT NULL,
+      neighbour_ref TEXT NOT NULL,
+      similarity REAL NOT NULL,
+      computed_at TEXT NOT NULL,
+      PRIMARY KEY (source_ref, neighbour_ref)
+    );
+    CREATE INDEX IF NOT EXISTS idx_embedding_neighbours_ref ON tracker_embedding_neighbours(source_ref);
+
+    -- "Not duplicates" tombstones. When a human dismisses an auto-suggested
+    -- relates_to link or a merge candidate, we record the (a, b) pair here so
+    -- the nightly job stops re-proposing it. Stored unordered (min, max) so
+    -- direction doesn't matter on lookup.
+    CREATE TABLE IF NOT EXISTS tracker_embedding_tombstones (
+      item_a TEXT NOT NULL,
+      item_b TEXT NOT NULL,
+      reason TEXT,
+      created_by TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (item_a, item_b)
+    );
+
+    -- Per-item drift score cache. Avoids recomputing cosine(title, body)
+    -- every time the UI renders a list. Updated whenever either of the
+    -- corresponding embedding rows is rewritten.
+    CREATE TABLE IF NOT EXISTS tracker_embedding_drift (
+      item_id TEXT PRIMARY KEY,
+      drift_score REAL NOT NULL,
+      computed_at TEXT NOT NULL,
+      FOREIGN KEY (item_id) REFERENCES tracker_work_items(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_embedding_drift_score ON tracker_embedding_drift(drift_score);
+
+    -- Topic / cluster assignment, populated by the periodic clustering job.
+    -- Stored as a separate table (rather than a JSON blob in tracker_settings)
+    -- so we can index by item_id and answer "what cluster is item X in?" in
+    -- one query for kanban rendering.
+    CREATE TABLE IF NOT EXISTS tracker_embedding_clusters (
+      cluster_id INTEGER NOT NULL,
+      item_id TEXT NOT NULL,
+      label TEXT,
+      is_representative INTEGER NOT NULL DEFAULT 0,
+      computed_at TEXT NOT NULL,
+      PRIMARY KEY (cluster_id, item_id),
+      FOREIGN KEY (item_id) REFERENCES tracker_work_items(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_embedding_clusters_item ON tracker_embedding_clusters(item_id);
   `);
 }
 
@@ -1082,6 +1157,61 @@ export function _initTestTrackerDatabase(): void {
       value TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+  `);
+
+  // TRACK-283: embeddings tables. The createSchema() block above already
+  // contains the canonical DDL — call it again here is too coarse, so we
+  // mirror just the embeddings tables for the in-memory test DB.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS tracker_embeddings (
+      source_uri TEXT PRIMARY KEY,
+      source_kind TEXT NOT NULL,
+      source_ref TEXT NOT NULL,
+      text_hash TEXT NOT NULL,
+      embedding BLOB NOT NULL,
+      model TEXT NOT NULL,
+      dim INTEGER NOT NULL,
+      computed_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_embeddings_source_kind ON tracker_embeddings(source_kind);
+    CREATE INDEX IF NOT EXISTS idx_embeddings_source_ref ON tracker_embeddings(source_ref);
+
+    CREATE TABLE IF NOT EXISTS tracker_embedding_neighbours (
+      source_ref TEXT NOT NULL,
+      neighbour_ref TEXT NOT NULL,
+      similarity REAL NOT NULL,
+      computed_at TEXT NOT NULL,
+      PRIMARY KEY (source_ref, neighbour_ref)
+    );
+    CREATE INDEX IF NOT EXISTS idx_embedding_neighbours_ref ON tracker_embedding_neighbours(source_ref);
+
+    CREATE TABLE IF NOT EXISTS tracker_embedding_tombstones (
+      item_a TEXT NOT NULL,
+      item_b TEXT NOT NULL,
+      reason TEXT,
+      created_by TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (item_a, item_b)
+    );
+
+    CREATE TABLE IF NOT EXISTS tracker_embedding_drift (
+      item_id TEXT PRIMARY KEY,
+      drift_score REAL NOT NULL,
+      computed_at TEXT NOT NULL,
+      FOREIGN KEY (item_id) REFERENCES tracker_work_items(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_embedding_drift_score ON tracker_embedding_drift(drift_score);
+
+    CREATE TABLE IF NOT EXISTS tracker_embedding_clusters (
+      cluster_id INTEGER NOT NULL,
+      item_id TEXT NOT NULL,
+      label TEXT,
+      is_representative INTEGER NOT NULL DEFAULT 0,
+      computed_at TEXT NOT NULL,
+      PRIMARY KEY (cluster_id, item_id),
+      FOREIGN KEY (item_id) REFERENCES tracker_work_items(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_embedding_clusters_item ON tracker_embedding_clusters(item_id);
   `);
 }
 
@@ -3062,6 +3192,50 @@ export function removeLinkById(linkId: string, actor?: string): boolean {
 }
 
 /**
+ * Fetch a single link by its row id. Used to look up an embedding-suggested
+ * link before confirming or dismissing it.
+ */
+export function getLink(linkId: string): Link | undefined {
+  return db
+    .prepare("SELECT * FROM tracker_links WHERE id = ?")
+    .get(linkId) as Link | undefined;
+}
+
+/**
+ * Confirm an auto-suggested link by upgrading its source from `embedding` to
+ * `manual` and clearing the confidence score. The link's other fields are
+ * preserved. Returns true if the row was updated.
+ *
+ * Why this exists: the Smart Related panel adds suggested `relates_to` links
+ * with `source='embedding'`. Clicking Confirm should promote the link to a
+ * first-class manual link so it survives a re-run of the embedding job and
+ * isn't styled as a suggestion any more.
+ */
+export function upgradeLinkSource(linkId: string, actor?: string): boolean {
+  const row = getLink(linkId);
+  if (!row) return false;
+  if (row.source === "manual") return false; // Already manual; nothing to do.
+  db
+    .prepare(
+      "UPDATE tracker_links SET source = 'manual', confidence = NULL WHERE id = ?",
+    )
+    .run(linkId);
+  logActivity({
+    action: "link.confirmed",
+    item_id: row.from_item_id,
+    actor: actor || "dashboard",
+    summary: `Confirmed ${row.relation} link (was ${row.source}-suggested)`,
+    details: {
+      link_id: row.id,
+      to_item_id: row.to_item_id,
+      relation: row.relation,
+      previous_source: row.source,
+    },
+  });
+  return true;
+}
+
+/**
  * List all links involving an item — both directions, with symmetric relations
  * expanded so callers see a normalized "from the item's perspective" shape.
  *
@@ -4695,4 +4869,475 @@ export function getAllSettings(): Record<string, unknown> {
     }
   }
   return result;
+}
+
+// ── Embeddings (TRACK-283) ──
+//
+// The DB layer here is *pure persistence*. The provider call and vector math
+// live in src/embeddings.ts. The orchestrator owns the debounce + scheduling.
+// This split keeps testability tight: each layer can be exercised in isolation
+// without monkey-patching network calls or scheduling.
+
+/**
+ * Build the canonical source_uri for a tracker item's body embedding.
+ * Keep this in sync with the title variant — both forms must be reproducible
+ * from the item ID alone so callers can look up either without round-tripping.
+ */
+export function itemEmbeddingUri(itemId: string): string {
+  return `tracker://item/${itemId}`;
+}
+
+/** Title-only embedding URI (used by the drift detector). */
+export function itemTitleEmbeddingUri(itemId: string): string {
+  return `tracker://item/${itemId}#title`;
+}
+
+export interface EmbeddingRow {
+  source_uri: string;
+  source_kind: string;
+  source_ref: string;
+  text_hash: string;
+  embedding: Buffer;
+  model: string;
+  dim: number;
+  computed_at: string;
+}
+
+/**
+ * Upsert an embedding row, keyed by source_uri.
+ *
+ * If a row already exists with the same source_uri AND text_hash, returns
+ * `{ written: false }` — the embedding didn't need to be recomputed. The
+ * caller (the worker) uses this to skip Voyage API calls when the input
+ * text hasn't changed.
+ *
+ * If text_hash differs (or no row exists), writes the new row and returns
+ * `{ written: true, previous? }`.
+ */
+export function upsertEmbedding(args: {
+  source_uri: string;
+  source_kind: string;
+  source_ref: string;
+  text_hash: string;
+  embedding: Buffer;
+  model: string;
+  dim: number;
+}): { written: boolean; previous?: EmbeddingRow } {
+  const existing = db
+    .prepare("SELECT * FROM tracker_embeddings WHERE source_uri = ?")
+    .get(args.source_uri) as EmbeddingRow | undefined;
+
+  if (existing && existing.text_hash === args.text_hash) {
+    return { written: false, previous: existing };
+  }
+
+  const ts = now();
+  db.prepare(
+    `INSERT OR REPLACE INTO tracker_embeddings
+     (source_uri, source_kind, source_ref, text_hash, embedding, model, dim, computed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    args.source_uri,
+    args.source_kind,
+    args.source_ref,
+    args.text_hash,
+    args.embedding,
+    args.model,
+    args.dim,
+    ts,
+  );
+  return { written: true, previous: existing };
+}
+
+/** Fetch a single embedding by source_uri. */
+export function getEmbedding(sourceUri: string): EmbeddingRow | undefined {
+  return db
+    .prepare("SELECT * FROM tracker_embeddings WHERE source_uri = ?")
+    .get(sourceUri) as EmbeddingRow | undefined;
+}
+
+/**
+ * Fetch all item-kind embeddings (body embedding, not title). Used by the
+ * nightly neighbour-computation job and by the cluster job.
+ *
+ * Excludes title-only rows by matching source_kind='item' (title rows use
+ * source_kind='item-title') so we don't accidentally compare title-against-body.
+ */
+export function listItemEmbeddings(): EmbeddingRow[] {
+  return db
+    .prepare(
+      "SELECT * FROM tracker_embeddings WHERE source_kind = 'item' ORDER BY computed_at DESC",
+    )
+    .all() as EmbeddingRow[];
+}
+
+/** Delete the embedding rows (body + title) for a tracker item. */
+export function deleteItemEmbeddings(itemId: string): number {
+  const r = db
+    .prepare(
+      "DELETE FROM tracker_embeddings WHERE source_uri = ? OR source_uri = ?",
+    )
+    .run(itemEmbeddingUri(itemId), itemTitleEmbeddingUri(itemId));
+  // Also clear cached drift score
+  db.prepare("DELETE FROM tracker_embedding_drift WHERE item_id = ?").run(itemId);
+  return r.changes;
+}
+
+export interface NeighbourRow {
+  source_ref: string;
+  neighbour_ref: string;
+  similarity: number;
+  computed_at: string;
+}
+
+/**
+ * Replace all neighbours for a given source item.
+ *
+ * Atomic-ish: deletes all existing rows, then inserts the new ones in a single
+ * transaction. The nightly job sends the *complete* top-K list, so partial
+ * upserts would leave stale rows.
+ */
+export function replaceNeighbours(
+  sourceRef: string,
+  neighbours: Array<{ neighbour_ref: string; similarity: number }>,
+): void {
+  const ts = now();
+  const del = db.prepare(
+    "DELETE FROM tracker_embedding_neighbours WHERE source_ref = ?",
+  );
+  const ins = db.prepare(
+    `INSERT INTO tracker_embedding_neighbours
+     (source_ref, neighbour_ref, similarity, computed_at)
+     VALUES (?, ?, ?, ?)`,
+  );
+  const tx = db.transaction(() => {
+    del.run(sourceRef);
+    for (const n of neighbours) {
+      ins.run(sourceRef, n.neighbour_ref, n.similarity, ts);
+    }
+  });
+  tx();
+}
+
+/** Fetch the top-K precomputed neighbours for an item, ordered by similarity descending. */
+export function getNeighbours(
+  sourceRef: string,
+  opts?: { threshold?: number; limit?: number },
+): NeighbourRow[] {
+  const conditions = ["source_ref = ?"];
+  const params: unknown[] = [sourceRef];
+  if (opts?.threshold !== undefined) {
+    conditions.push("similarity >= ?");
+    params.push(opts.threshold);
+  }
+  const limit = opts?.limit ?? 50;
+  const sql = `SELECT * FROM tracker_embedding_neighbours
+               WHERE ${conditions.join(" AND ")}
+               ORDER BY similarity DESC
+               LIMIT ${Math.max(1, Math.min(500, limit))}`;
+  return db.prepare(sql).all(...params) as NeighbourRow[];
+}
+
+/**
+ * Fetch all neighbour pairs above a threshold across the whole corpus,
+ * ordered by similarity descending. Used to populate the Merge Candidates
+ * view, which needs the global top-N pairs (not per-item).
+ *
+ * Pairs are deduplicated unordered: (a, b) and (b, a) collapse to one row
+ * where item_a < item_b. Tombstoned pairs are excluded.
+ */
+export function getGlobalCandidatePairs(opts?: {
+  threshold?: number;
+  limit?: number;
+}): Array<{ item_a: string; item_b: string; similarity: number }> {
+  const threshold = opts?.threshold ?? 0.92;
+  const limit = Math.max(1, Math.min(500, opts?.limit ?? 100));
+  // Self-join the neighbours table, normalize to (min, max), filter tombstones,
+  // dedupe with a GROUP BY (taking MAX similarity if both directions present).
+  const sql = `
+    SELECT
+      CASE WHEN source_ref < neighbour_ref THEN source_ref ELSE neighbour_ref END AS item_a,
+      CASE WHEN source_ref < neighbour_ref THEN neighbour_ref ELSE source_ref END AS item_b,
+      MAX(similarity) AS similarity
+    FROM tracker_embedding_neighbours
+    WHERE similarity >= ?
+      AND source_ref != neighbour_ref
+    GROUP BY item_a, item_b
+    HAVING NOT EXISTS (
+      SELECT 1 FROM tracker_embedding_tombstones t
+      WHERE t.item_a = item_a AND t.item_b = item_b
+    )
+    ORDER BY similarity DESC
+    LIMIT ?
+  `;
+  return db.prepare(sql).all(threshold, limit) as Array<{
+    item_a: string;
+    item_b: string;
+    similarity: number;
+  }>;
+}
+
+// ── Tombstones (TRACK-283) ──
+//
+// When a human dismisses an auto-suggested relates_to link, or clicks
+// "Not duplicates" on a merge candidate, we record the pair here so the
+// nightly job doesn't re-propose it. Stored unordered (item_a < item_b)
+// so direction doesn't matter at write time.
+
+function normalizePair(a: string, b: string): [string, string] {
+  return a < b ? [a, b] : [b, a];
+}
+
+/** Add a tombstone — idempotent on the unordered pair. */
+export function addEmbeddingTombstone(args: {
+  item_a: string;
+  item_b: string;
+  reason?: string;
+  created_by: string;
+}): void {
+  if (args.item_a === args.item_b) return; // self-pair is meaningless
+  const [a, b] = normalizePair(args.item_a, args.item_b);
+  db.prepare(
+    `INSERT OR IGNORE INTO tracker_embedding_tombstones
+     (item_a, item_b, reason, created_by, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(a, b, args.reason ?? null, args.created_by, now());
+
+  // Also remove any auto-suggested relates_to link between the pair (in
+  // either direction) — the dismissal should clear the surfaced link.
+  db.prepare(
+    `DELETE FROM tracker_links
+     WHERE relation = 'relates_to' AND source = 'embedding'
+       AND ((from_item_id = ? AND to_item_id = ?) OR (from_item_id = ? AND to_item_id = ?))`,
+  ).run(a, b, b, a);
+}
+
+/** Is the unordered pair (a, b) tombstoned? */
+export function hasEmbeddingTombstone(a: string, b: string): boolean {
+  const [x, y] = normalizePair(a, b);
+  const row = db
+    .prepare(
+      "SELECT 1 FROM tracker_embedding_tombstones WHERE item_a = ? AND item_b = ?",
+    )
+    .get(x, y);
+  return !!row;
+}
+
+export function listEmbeddingTombstones(): Array<{
+  item_a: string;
+  item_b: string;
+  reason: string | null;
+  created_by: string;
+  created_at: string;
+}> {
+  return db
+    .prepare(
+      "SELECT item_a, item_b, reason, created_by, created_at FROM tracker_embedding_tombstones ORDER BY created_at DESC",
+    )
+    .all() as Array<{
+    item_a: string;
+    item_b: string;
+    reason: string | null;
+    created_by: string;
+    created_at: string;
+  }>;
+}
+
+// ── Drift cache (TRACK-283) ──
+
+export function upsertDriftScore(itemId: string, score: number): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO tracker_embedding_drift (item_id, drift_score, computed_at)
+     VALUES (?, ?, ?)`,
+  ).run(itemId, score, now());
+}
+
+export function getDriftScore(itemId: string): number | null {
+  const row = db
+    .prepare("SELECT drift_score FROM tracker_embedding_drift WHERE item_id = ?")
+    .get(itemId) as { drift_score: number } | undefined;
+  return row ? row.drift_score : null;
+}
+
+/**
+ * Return the top-N items with the highest drift scores, excluding done /
+ * cancelled items (no point flagging drift on closed work).
+ */
+export function listHighDriftItems(opts?: {
+  threshold?: number;
+  limit?: number;
+}): Array<{ item_id: string; drift_score: number; computed_at: string }> {
+  const threshold = opts?.threshold ?? 0.35;
+  const limit = Math.max(1, Math.min(500, opts?.limit ?? 50));
+  return db
+    .prepare(
+      `SELECT d.item_id, d.drift_score, d.computed_at
+       FROM tracker_embedding_drift d
+       JOIN tracker_work_items wi ON wi.id = d.item_id
+       WHERE d.drift_score >= ?
+         AND wi.state NOT IN ('done', 'cancelled')
+       ORDER BY d.drift_score DESC
+       LIMIT ?`,
+    )
+    .all(threshold, limit) as Array<{
+    item_id: string;
+    drift_score: number;
+    computed_at: string;
+  }>;
+}
+
+/** Bulk drift lookup for a batch of items (used by tracker view rendering). */
+export function getDriftScoresBatch(
+  itemIds: string[],
+): Record<string, number> {
+  if (itemIds.length === 0) return {};
+  const placeholders = itemIds.map(() => "?").join(",");
+  const rows = db
+    .prepare(
+      `SELECT item_id, drift_score FROM tracker_embedding_drift WHERE item_id IN (${placeholders})`,
+    )
+    .all(...itemIds) as Array<{ item_id: string; drift_score: number }>;
+  const out: Record<string, number> = {};
+  for (const r of rows) out[r.item_id] = r.drift_score;
+  return out;
+}
+
+// ── Cluster assignment (TRACK-283) ──
+
+export interface ClusterRow {
+  cluster_id: number;
+  item_id: string;
+  label: string | null;
+  is_representative: number;
+  computed_at: string;
+}
+
+/**
+ * Replace the entire cluster assignment table.
+ * Clustering produces a global partitioning, so we always rewrite from scratch.
+ * Old labels are preserved per-cluster_id if the caller passes preserveLabels=true.
+ */
+export function replaceClusters(
+  assignments: Array<{
+    cluster_id: number;
+    item_id: string;
+    label?: string | null;
+    is_representative?: boolean;
+  }>,
+  opts?: { preserveLabels?: boolean },
+): void {
+  const ts = now();
+  let labelByCluster: Record<number, string | null> = {};
+  if (opts?.preserveLabels) {
+    const rows = db
+      .prepare(
+        "SELECT cluster_id, label FROM tracker_embedding_clusters WHERE label IS NOT NULL GROUP BY cluster_id",
+      )
+      .all() as Array<{ cluster_id: number; label: string | null }>;
+    for (const r of rows) labelByCluster[r.cluster_id] = r.label;
+  }
+
+  const tx = db.transaction(() => {
+    db.exec("DELETE FROM tracker_embedding_clusters");
+    const ins = db.prepare(
+      `INSERT INTO tracker_embedding_clusters
+       (cluster_id, item_id, label, is_representative, computed_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    );
+    for (const a of assignments) {
+      const label = a.label ?? labelByCluster[a.cluster_id] ?? null;
+      ins.run(
+        a.cluster_id,
+        a.item_id,
+        label,
+        a.is_representative ? 1 : 0,
+        ts,
+      );
+    }
+  });
+  tx();
+}
+
+export function listClusters(): Array<{
+  cluster_id: number;
+  label: string | null;
+  size: number;
+  computed_at: string;
+}> {
+  return db
+    .prepare(
+      `SELECT cluster_id, MAX(label) AS label, COUNT(*) AS size, MAX(computed_at) AS computed_at
+       FROM tracker_embedding_clusters
+       GROUP BY cluster_id
+       ORDER BY size DESC, cluster_id ASC`,
+    )
+    .all() as Array<{
+    cluster_id: number;
+    label: string | null;
+    size: number;
+    computed_at: string;
+  }>;
+}
+
+export function getClusterMembers(clusterId: number): ClusterRow[] {
+  return db
+    .prepare(
+      "SELECT * FROM tracker_embedding_clusters WHERE cluster_id = ? ORDER BY is_representative DESC, item_id ASC",
+    )
+    .all(clusterId) as ClusterRow[];
+}
+
+export function setClusterLabel(clusterId: number, label: string): void {
+  db.prepare(
+    "UPDATE tracker_embedding_clusters SET label = ? WHERE cluster_id = ?",
+  ).run(label, clusterId);
+}
+
+/** Aggregate stats for the embeddings status endpoint. */
+export function getEmbeddingStatus(): {
+  total_embeddings: number;
+  item_embeddings: number;
+  title_embeddings: number;
+  neighbour_pairs: number;
+  tombstones: number;
+  high_drift_items: number;
+  clusters: number;
+  last_neighbour_run: string | null;
+} {
+  const row = db
+    .prepare(
+      `SELECT
+         COUNT(*) AS total_embeddings,
+         SUM(CASE WHEN source_kind = 'item' THEN 1 ELSE 0 END) AS item_embeddings,
+         SUM(CASE WHEN source_kind = 'item-title' THEN 1 ELSE 0 END) AS title_embeddings
+       FROM tracker_embeddings`,
+    )
+    .get() as {
+    total_embeddings: number;
+    item_embeddings: number | null;
+    title_embeddings: number | null;
+  };
+  const np = db
+    .prepare("SELECT COUNT(*) AS c FROM tracker_embedding_neighbours")
+    .get() as { c: number };
+  const ts = db
+    .prepare("SELECT COUNT(*) AS c FROM tracker_embedding_tombstones")
+    .get() as { c: number };
+  const hd = db
+    .prepare("SELECT COUNT(*) AS c FROM tracker_embedding_drift WHERE drift_score >= 0.35")
+    .get() as { c: number };
+  const cl = db
+    .prepare("SELECT COUNT(DISTINCT cluster_id) AS c FROM tracker_embedding_clusters")
+    .get() as { c: number };
+  const last = getSetting<string>("embeddings.last_neighbour_run");
+  return {
+    total_embeddings: row.total_embeddings ?? 0,
+    item_embeddings: row.item_embeddings ?? 0,
+    title_embeddings: row.title_embeddings ?? 0,
+    neighbour_pairs: np.c,
+    tombstones: ts.c,
+    high_drift_items: hd.c,
+    clusters: cl.c,
+    last_neighbour_run: last || null,
+  };
 }

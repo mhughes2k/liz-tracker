@@ -101,6 +101,17 @@ import {
   listAttachments,
   deleteAttachment,
   listActivity,
+  getNeighbours,
+  getDriftScore,
+  getGlobalCandidatePairs,
+  addEmbeddingTombstone,
+  listEmbeddingTombstones,
+  getEmbeddingStatus,
+  listClusters,
+  getClusterMembers,
+  setClusterLabel,
+  upgradeLinkSource,
+  getLink,
   MAX_ATTACHMENT_SIZE,
   createDescriptionVersion,
   listDescriptionVersions,
@@ -130,7 +141,8 @@ import {
   steerSession,
   getActiveSession,
 } from "./orchestrator.js";
-import { OPENCODE_PUBLIC_URL, buildOpencodeSessionUrl, TRACKER_API_TOKEN, STORE_DIR, buildItemUrl, TRACKER_PUBLIC_URL, PORT, ANTHROPIC_API_KEY, AI_CATEGORIZE_MODEL, DISPATCH_MODE, setLastDashboardBaseUrl, CODER_MODEL_ID, CODER_MODEL_PROVIDER, CODER_EFFORT, MODEL_STRENGTH_MAP } from "./config.js";
+import { enqueueBackfill, runNeighbourJob, isEmbeddingsEnabled } from "./embeddings-worker.js";
+import { OPENCODE_PUBLIC_URL, buildOpencodeSessionUrl, TRACKER_API_TOKEN, STORE_DIR, buildItemUrl, TRACKER_PUBLIC_URL, PORT, ANTHROPIC_API_KEY, AI_CATEGORIZE_MODEL, DISPATCH_MODE, setLastDashboardBaseUrl, CODER_MODEL_ID, CODER_MODEL_PROVIDER, CODER_EFFORT, MODEL_STRENGTH_MAP, EMBEDDING_PROVIDER, EMBEDDING_RELATES_THRESHOLD, EMBEDDING_MERGE_THRESHOLD, EMBEDDING_DRIFT_THRESHOLD } from "./config.js";
 import { getSpacePlugin, getCoverSpaceTypes } from "./spaces/index.js";
 import { sanitizeScheduledSpaceData } from "./spaces/scheduled.js";
 
@@ -1323,6 +1335,52 @@ Extract the structured fields from this description. Return ONLY valid JSON.`;
         return json(res, { deleted: true });
       }
 
+      // TRACK-283: POST /items/:id/links/:linkId/confirm — promote a
+      // suggested embedding link to a manual link.
+      if (
+        parts.length === 5 &&
+        parts[2] === "links" &&
+        parts[4] === "confirm" &&
+        method === "POST"
+      ) {
+        const linkId = decodeURIComponent(parts[3]);
+        const body = await parseBody(req);
+        const actor = body.actor ? String(body.actor) : "dashboard";
+        const link = getLink(linkId);
+        if (!link) return error(res, "Link not found", 404);
+        const ok = upgradeLinkSource(linkId, actor);
+        return json(res, { confirmed: ok, link: getLink(linkId) });
+      }
+
+      // TRACK-283: GET /items/:id/similar — top-K embedding neighbours
+      // above an optional threshold. Hydrated with key/title/state for the UI.
+      if (parts.length === 3 && parts[2] === "similar" && method === "GET") {
+        const qs = queryParams(req.url || "");
+        const threshold = qs.get("threshold") ? parseFloat(qs.get("threshold")!) : EMBEDDING_RELATES_THRESHOLD;
+        const limit = qs.get("limit") ? parseInt(qs.get("limit")!, 10) : 10;
+        const neighbours = getNeighbours(itemId, { threshold, limit });
+        const drift = getDriftScore(itemId);
+        const hydrated = neighbours
+          .map((n) => {
+            const it = getWorkItem(n.neighbour_ref);
+            if (!it) return null;
+            const proj = getProject(it.project_id);
+            return {
+              id: it.id,
+              key: getWorkItemKey(it),
+              title: it.title,
+              state: it.state,
+              priority: it.priority,
+              project_id: it.project_id,
+              project_short_name: proj?.short_name || null,
+              project_theme: proj?.theme || null,
+              similarity: n.similarity,
+            };
+          })
+          .filter((x): x is NonNullable<typeof x> => x !== null);
+        return json(res, { neighbours: hydrated, drift });
+      }
+
       // TRACK-281: GET /items/:id/children — hydrated children list for the
       // Children panel + parent badge.
       if (
@@ -2117,6 +2175,132 @@ Extract the structured fields from this description. Return ONLY valid JSON.`;
       // GET /orchestrator/safe-to-restart — quick check if restart is safe
       if (parts.length === 2 && parts[1] === "safe-to-restart" && method === "GET") {
         return json(res, isSafeToRestart());
+      }
+    }
+
+    // ── Embeddings (TRACK-283) ──
+    if (parts[0] === "embeddings") {
+      // GET /embeddings/status — aggregate counts for the operator UI.
+      if (parts.length === 2 && parts[1] === "status" && method === "GET") {
+        const status = getEmbeddingStatus();
+        return json(res, {
+          enabled: isEmbeddingsEnabled(),
+          provider: EMBEDDING_PROVIDER,
+          relates_threshold: EMBEDDING_RELATES_THRESHOLD,
+          merge_threshold: EMBEDDING_MERGE_THRESHOLD,
+          drift_threshold: EMBEDDING_DRIFT_THRESHOLD,
+          ...status,
+        });
+      }
+
+      // POST /embeddings/recompute — admin endpoint: re-enqueue every item.
+      // Body: { project_id?, force? } — force=true clears cached embeddings
+      // so the text_hash skip doesn't short-circuit.
+      if (parts.length === 2 && parts[1] === "recompute" && method === "POST") {
+        const body = await parseBody(req);
+        const count = enqueueBackfill({
+          projectId: body.project_id ? String(body.project_id) : undefined,
+          force: body.force === true,
+        });
+        // Also kick the neighbour job manually — fire-and-forget so the HTTP
+        // response returns promptly even on large corpora.
+        if (body.run_neighbours === true) {
+          void runNeighbourJob().catch((e) =>
+            logger.error({ err: e }, "Manual neighbour job failed"),
+          );
+        }
+        return json(res, { enqueued: count, neighbour_job_started: body.run_neighbours === true });
+      }
+
+      // GET /embeddings/merge-candidates — top global high-similarity pairs.
+      // Used by the Merge Candidates view.
+      if (parts.length === 2 && parts[1] === "merge-candidates" && method === "GET") {
+        const qs = queryParams(req.url || "");
+        const threshold = qs.get("threshold") ? parseFloat(qs.get("threshold")!) : EMBEDDING_MERGE_THRESHOLD;
+        const limit = qs.get("limit") ? parseInt(qs.get("limit")!, 10) : 50;
+        const pairs = getGlobalCandidatePairs({ threshold, limit });
+        // Hydrate both sides
+        const hydrated = pairs
+          .map((p) => {
+            const a = getWorkItem(p.item_a);
+            const b = getWorkItem(p.item_b);
+            if (!a || !b) return null;
+            return {
+              a: { id: a.id, key: getWorkItemKey(a), title: a.title, state: a.state, project_id: a.project_id },
+              b: { id: b.id, key: getWorkItemKey(b), title: b.title, state: b.state, project_id: b.project_id },
+              similarity: p.similarity,
+            };
+          })
+          .filter((x): x is NonNullable<typeof x> => x !== null);
+        return json(res, hydrated);
+      }
+
+      // GET /embeddings/topics — cluster assignments for the Topics view.
+      if (parts.length === 2 && parts[1] === "topics" && method === "GET") {
+        const clusters = listClusters();
+        const result = clusters.map((c) => {
+          const members = getClusterMembers(c.cluster_id)
+            .map((m) => {
+              const it = getWorkItem(m.item_id);
+              if (!it) return null;
+              return {
+                id: it.id,
+                key: getWorkItemKey(it),
+                title: it.title,
+                state: it.state,
+                project_id: it.project_id,
+                is_representative: !!m.is_representative,
+              };
+            })
+            .filter((x): x is NonNullable<typeof x> => x !== null);
+          return {
+            cluster_id: c.cluster_id,
+            label: c.label,
+            size: members.length,
+            members,
+          };
+        });
+        return json(res, result);
+      }
+
+      // PATCH /embeddings/clusters/:id/label — rename a cluster.
+      if (
+        parts.length === 4 &&
+        parts[1] === "clusters" &&
+        parts[3] === "label" &&
+        method === "PATCH"
+      ) {
+        const cid = parseInt(parts[2], 10);
+        if (!Number.isFinite(cid)) return error(res, "Invalid cluster id");
+        const body = await parseBody(req);
+        const label = body.label ? String(body.label) : "";
+        setClusterLabel(cid, label);
+        return json(res, { cluster_id: cid, label });
+      }
+
+      // POST /embeddings/tombstones — record "these two items are not duplicates".
+      if (parts.length === 2 && parts[1] === "tombstones" && method === "POST") {
+        const body = await parseBody(req);
+        if (!body.item_a || !body.item_b) return error(res, "item_a and item_b are required");
+        let a = String(body.item_a);
+        let b = String(body.item_b);
+        const aByKey = getWorkItemByKey(a);
+        if (aByKey) a = aByKey.id;
+        const bByKey = getWorkItemByKey(b);
+        if (bByKey) b = bByKey.id;
+        const actor = body.actor ? String(body.actor) : "dashboard";
+        addEmbeddingTombstone({
+          item_a: a,
+          item_b: b,
+          reason: body.reason ? String(body.reason) : undefined,
+          created_by: actor,
+        });
+        return json(res, { tombstoned: true });
+      }
+
+      // GET /embeddings/tombstones — list all tombstones (for admin/debug).
+      if (parts.length === 2 && parts[1] === "tombstones" && method === "GET") {
+        return json(res, listEmbeddingTombstones());
       }
     }
 

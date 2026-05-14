@@ -17106,12 +17106,60 @@
           // Auto-extracted links display a small "auto" badge and are not user-removable
           // (the body text owns them; edit the description to remove a mention).
           const isAuto = link.source === 'mention';
+          // TRACK-283: embedding-suggested links get a ✨ marker plus
+          // Confirm/Dismiss buttons. Confirm promotes source → manual;
+          // Dismiss removes the link AND records a tombstone so the
+          // nightly job doesn't re-propose it.
+          const isEmbed = link.source === 'embedding';
           if (isAuto) {
             const badge = document.createElement('span');
             badge.className = 'related-source-badge';
             badge.title = 'Auto-extracted from description. Edit the body text to remove.';
             badge.textContent = 'auto';
             row.appendChild(badge);
+          } else if (isEmbed) {
+            const sparkle = document.createElement('span');
+            sparkle.className = 'related-source-badge';
+            sparkle.title = `Suggested by semantic similarity${typeof link.confidence === 'number' ? ` (${link.confidence.toFixed(2)})` : ''}. Click Confirm to keep, Dismiss to remove and prevent future suggestions.`;
+            sparkle.textContent = '✨';
+            row.appendChild(sparkle);
+
+            const confirmBtn = document.createElement('button');
+            confirmBtn.className = 'related-remove';
+            confirmBtn.title = 'Confirm suggestion';
+            confirmBtn.textContent = '✓';
+            confirmBtn.addEventListener('click', async (e) => {
+              e.stopPropagation();
+              try {
+                await apiPost(`/items/${currentItemId}/links/${encodeURIComponent(link.id)}/confirm`, {});
+                toast('Link confirmed');
+                loadRelatedLinks(currentItemId);
+              } catch (err) {
+                toast('Failed to confirm: ' + err.message, 'error');
+              }
+            });
+            row.appendChild(confirmBtn);
+
+            const dismissBtn = document.createElement('button');
+            dismissBtn.className = 'related-remove';
+            dismissBtn.title = 'Dismiss suggestion (record as "not related")';
+            dismissBtn.textContent = '×';
+            dismissBtn.addEventListener('click', async (e) => {
+              e.stopPropagation();
+              try {
+                await apiPost(`/embeddings/tombstones`, {
+                  item_a: currentItemId,
+                  item_b: link.other_item_id,
+                  reason: 'dismissed-from-related-panel',
+                });
+                await apiDelete(`/items/${currentItemId}/links/${encodeURIComponent(link.id)}`);
+                toast('Link dismissed');
+                loadRelatedLinks(currentItemId);
+              } catch (err) {
+                toast('Failed to dismiss: ' + err.message, 'error');
+              }
+            });
+            row.appendChild(dismissBtn);
           } else {
             const removeBtn = document.createElement('button');
             removeBtn.className = 'related-remove';

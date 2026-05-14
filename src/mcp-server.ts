@@ -53,6 +53,8 @@ import {
   listAttachments,
   deleteAttachment,
   listActivity,
+  getNeighbours,
+  getDriftScore,
   MAX_ATTACHMENT_SIZE,
   VALID_STATES,
   VALID_PRIORITIES,
@@ -705,6 +707,54 @@ function createMcpServer(): McpServer {
           return `  - [${bKey}] "${b.title}" [${b.state}] (${b.id})`;
         }).join("\n");
       return { content: [{ type: "text", text: msg }] };
+    },
+  );
+
+  // ── Embeddings (TRACK-283) ──
+
+  server.tool(
+    "tracker_find_similar",
+    "Find work items semantically similar to a given item using cached embedding neighbours. Returns the top-K precomputed neighbours above the threshold. " +
+      "Use this to surface possible duplicates, related items, or topic siblings before opening a new ticket. Pull-only — no notifications are sent.",
+    {
+      item_id: z.string().describe("Work item ID or display key (e.g. \"TRACK-5\")"),
+      threshold: z.number().min(0).max(1).optional().describe("Minimum cosine similarity (default: 0.85)"),
+      limit: z.number().int().min(1).max(50).optional().describe("Maximum number of neighbours to return (default: 10)"),
+    },
+    async (args) => {
+      const itemId = resolveId(args.item_id);
+      const neighbours = getNeighbours(itemId, {
+        threshold: args.threshold ?? 0.85,
+        limit: args.limit ?? 10,
+      });
+      if (neighbours.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                "No similar items found above the threshold. Note: neighbours are precomputed nightly — " +
+                "newly created items may not yet have a neighbour set.",
+            },
+          ],
+        };
+      }
+      const lines = neighbours.map((n) => {
+        const item = getWorkItem(n.neighbour_ref);
+        if (!item) return `  - (deleted ${n.neighbour_ref}) sim=${n.similarity.toFixed(3)}`;
+        const key = getWorkItemKey(item);
+        return `  - [${key}] "${item.title}" [${item.state}] sim=${n.similarity.toFixed(3)}`;
+      });
+      const drift = getDriftScore(itemId);
+      const driftLine = drift !== null ? `\n\nDrift score: ${drift.toFixed(3)} (higher = title and description have diverged)` : "";
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Similar items:\n${lines.join("\n")}${driftLine}`,
+          },
+        ],
+      };
     },
   );
 

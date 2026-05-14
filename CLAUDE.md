@@ -16,7 +16,9 @@ Standalone project management tracker with kanban UI, REST API, MCP tools, and O
 | File | Description |
 | --- | --- |
 | `src/index.ts` | Entry point — init DB, start server, optionally start orchestrator |
-| `src/config.ts` | Config from env vars / `.env` file: PORT, STORE_DIR, TRACKER_PUBLIC_URL, TRACKER_SHORT_URL, OPENCODE_SERVER_URL, OPENCODE_PUBLIC_URL, ORCHESTRATOR_ENABLED, ORCHESTRATOR_INTERVAL, OPENCODE_MAX_CONCURRENT, OPENCODE_MAX_PER_PROJECT, ANTHROPIC_API_KEY, AI_CATEGORIZE_MODEL, DECKWRIGHT_URL |
+| `src/config.ts` | Config from env vars / `.env` file: PORT, STORE_DIR, TRACKER_PUBLIC_URL, TRACKER_SHORT_URL, OPENCODE_SERVER_URL, OPENCODE_PUBLIC_URL, ORCHESTRATOR_ENABLED, ORCHESTRATOR_INTERVAL, OPENCODE_MAX_CONCURRENT, OPENCODE_MAX_PER_PROJECT, ANTHROPIC_API_KEY, AI_CATEGORIZE_MODEL, DECKWRIGHT_URL, EMBEDDING_PROVIDER, VOYAGE_API_KEY, VOYAGE_MODEL |
+| `src/embeddings.ts` | Embedding provider abstraction — Voyage, Anthropic (fallback), local/mock providers. Vector math: cosineSimilarity, encode/decodeVector, textHash, buildItemEmbeddingText |
+| `src/embeddings-worker.ts` | Worker: debounced refresh queue (30s), nightly neighbour computation (top-K), drift score, clustering (connected components) |
 | `src/logger.ts` | Pino logger with pino-pretty |
 | `src/db.ts` | SQLite database layer — schema, CRUD, events, migrations, activity logging |
 | `src/api.ts` | HTTP server — REST API + static file serving + MCP routing + generic space route dispatcher |
@@ -771,6 +773,83 @@ Adding a new space type requires 2 files + 1 registry line + build:
 5. **Update CLAUDE.md** — add the new space to the tables above
 
 Zero changes needed to `api.ts`, `mcp-server.ts`, `db.ts`, or the overlay shell in `core.html`.
+
+## Embeddings (TRACK-283 / Phase 4 of TRACK-276)
+
+Tracker maintains a small vector index of every work item so the dashboard can surface semantic neighbours, merge candidates, topic clusters, and drift indicators. Surfacing is pull-only — no notifications, no badges in the topbar.
+
+### Architecture
+
+**Generic schema, item-aware pipeline.** The `tracker_embeddings` table is keyed by `source_uri` (e.g. `tracker://item/{id}` and `tracker://item/{id}#title`) so future entity-wiki and query-expansion work (LIZ-230, LIZ-201) can share the same table. Today only items are embedded.
+
+| Table | Purpose |
+| --- | --- |
+| `tracker_embeddings` | One row per (source_uri). Stores raw float32 BLOB + model + dim + text_hash + computed_at |
+| `tracker_embedding_neighbours` | Pre-computed top-K similar items per source_ref; refreshed nightly |
+| `tracker_embedding_tombstones` | Normalized (item_a, item_b) pairs the user has marked "not duplicates"; the nightly job filters these out |
+| `tracker_embedding_drift` | Cached drift score per item = 1 − cosine(title-only-vec, title+description-vec). Flags items whose body has wandered from its title |
+| `tracker_embedding_clusters` | Cluster_id → item_id assignments. Labels are user-editable; representative items are picked by lexicographic ID |
+
+### Providers
+
+| `EMBEDDING_PROVIDER` | Behaviour |
+| --- | --- |
+| `voyage` | Production. Posts to `VOYAGE_API_URL` with model `VOYAGE_MODEL` (default `voyage-3`, 1024 dim). Requires `VOYAGE_API_KEY` |
+| `anthropic` | Falls back to `local` with a one-time warning. No public Anthropic embeddings API exists yet |
+| `local` / `mock` | Default. Deterministic SHA-256-derived 256-dim L2-normalized vector. Identical text always yields identical vector — enough for tests and offline operation, but NOT semantically meaningful |
+
+### Compute pipeline
+
+1. **Enqueue (event-driven).** Orchestrator subscribes to `work_item.created` / `.updated` / `.moved` events and calls `enqueueEmbeddingRefresh(itemId)`. The refresh fires after `EMBEDDING_DEBOUNCE_MS` (default 30s) — rapid edits collapse into one compute.
+2. **Drain (every tick).** Orchestrator's `tick()` calls `drainEmbeddingQueue()`. The worker computes both the body and title embeddings, skipping when `text_hash` matches the stored row (no Voyage call). Drift is recomputed when either embedding moves.
+3. **Nightly neighbour job (every `EMBEDDING_NEIGHBOUR_INTERVAL_MS`, default 24h).** `runNeighbourJob()` does pairwise cosine within each dim group (handles model upgrades cleanly), writes top-K to `tracker_embedding_neighbours`, and proposes `relates_to` links with `source='embedding'` + `confidence=similarity` for pairs above `EMBEDDING_RELATES_THRESHOLD` (default 0.85), skipping tombstoned pairs.
+4. **Clustering.** As a follow-up, the same job runs union-find on the similarity graph (threshold = relates_threshold) and writes assignments to `tracker_embedding_clusters`. Singletons are dropped. The lexicographically smallest ID becomes the representative.
+
+### Env vars
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `EMBEDDING_PROVIDER` | `local` | `voyage` | `anthropic` | `local` | `mock` |
+| `VOYAGE_API_KEY` | — | Required when provider=voyage |
+| `VOYAGE_MODEL` | `voyage-3` | Voyage model id |
+| `VOYAGE_API_URL` | `https://api.voyageai.com/v1/embeddings` | Override for self-hosted gateways |
+| `EMBEDDING_RELATES_THRESHOLD` | `0.85` | Minimum similarity to propose a `relates_to` link |
+| `EMBEDDING_MERGE_THRESHOLD` | `0.92` | Minimum similarity for the Merge Candidates view |
+| `EMBEDDING_DRIFT_THRESHOLD` | `0.35` | Minimum drift to flag with the 🪶 indicator |
+| `EMBEDDING_DEBOUNCE_MS` | `30000` | Delay between enqueue and compute |
+| `EMBEDDING_NEIGHBOUR_INTERVAL_MS` | `86400000` (24h) | Nightly neighbour job interval |
+| `EMBEDDING_NEIGHBOUR_K` | `10` | Top-K neighbours retained per item |
+
+### REST API
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/api/v1/items/:id/similar` | Top-K embedding neighbours for an item (query: `threshold`, `limit`). Returns hydrated items + drift score |
+| `POST` | `/api/v1/items/:id/links/:linkId/confirm` | Promote an embedding-suggested link to a manual link (source → `manual`) |
+| `GET` | `/api/v1/embeddings/status` | Aggregate stats (counts, provider, thresholds, last neighbour run) |
+| `POST` | `/api/v1/embeddings/recompute` | Admin: re-enqueue items (`{project_id?, force?, run_neighbours?}`) |
+| `GET` | `/api/v1/embeddings/merge-candidates` | Global high-similarity pairs (query: `threshold`, `limit`) |
+| `GET` | `/api/v1/embeddings/topics` | All clusters with members for the Topics view |
+| `PATCH` | `/api/v1/embeddings/clusters/:id/label` | Rename a cluster |
+| `POST` | `/api/v1/embeddings/tombstones` | Record "not duplicates" (`{item_a, item_b, reason?, actor?}`) |
+| `GET` | `/api/v1/embeddings/tombstones` | List all tombstones |
+
+### MCP tools
+
+| Tool | Description |
+| --- | --- |
+| `tracker_find_similar` | Find work items semantically similar to a given item (`{item_id, threshold?, limit?}`). Returns the top-K precomputed neighbours plus the drift score |
+
+### UI surfaces
+
+- **Smart Related panel.** Embedding-suggested `relates_to` links render with a ✨ marker plus a Confirm (✓) button (promotes to manual) and a Dismiss (×) button (records a tombstone and removes the link). Tombstones prevent the nightly job from re-proposing the same pair.
+- **Merge Candidates view.** (Endpoint shipped; UI tab can be added at any time.) Cross-corpus pairs above `EMBEDDING_MERGE_THRESHOLD`.
+- **Topics view.** (Endpoint shipped.) Connected-components clustering, lexicographic-ID representative per cluster, user-editable labels.
+- **Drift indicator 🪶.** (Endpoint shipped via `/items/:id/similar` response.) Surfaces on items whose body has diverged from its title.
+
+### Security
+
+Embedding-suggested links carry `source='embedding'` and `confidence`. They are visually distinct in the UI and require a human Confirm to promote to `manual`. Tombstones suppress future suggestions for the same pair. The auto-link path never grants approval, code access, or state transitions.
 
 ## Conventions
 

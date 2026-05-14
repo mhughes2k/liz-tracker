@@ -77,6 +77,12 @@ import { execFileSync, spawn, type ChildProcess } from "child_process";
 import { createInterface } from "readline";
 import type { RunnerEvent, RunnerConfig } from "./runner-types.js";
 import { computeNextRun } from "./spaces/scheduled.js";
+import {
+  drainEmbeddingQueue,
+  enqueueEmbeddingRefresh,
+  isEmbeddingsEnabled,
+  maybeRunNeighbourJob,
+} from "./embeddings-worker.js";
 
 // ── Helpers ──
 
@@ -756,6 +762,13 @@ export function startOrchestrator(): void {
   // Listen for clarification events to trigger immediate research dispatch
   startClarificationWatcher();
 
+  // Listen for item create/update events to enqueue embedding refreshes.
+  // The worker is silently no-op when embeddings are disabled.
+  if (isEmbeddingsEnabled()) {
+    startEmbeddingsWatcher();
+    logger.info("Embeddings worker enabled");
+  }
+
   // Start the scheduler loop
   intervalHandle = setInterval(tick, ORCHESTRATOR_INTERVAL);
 
@@ -1335,6 +1348,11 @@ function tick(): void {
 
   // Try to dispatch clarification (research) items
   tryClarify();
+
+  // Embedding maintenance — both safe to call every tick; they no-op
+  // when there's no work to do or the feature is disabled.
+  void drainEmbeddingQueue();
+  maybeRunNeighbourJob();
 }
 
 /**
@@ -4535,6 +4553,27 @@ function startClarificationWatcher(): void {
   });
 
   logger.info("Clarification watcher started — will trigger research dispatch on clarification transitions");
+}
+
+/**
+ * Listen for work item mutations and enqueue an embedding refresh for the
+ * affected item. The refresh is debounced (default 30s) inside the worker, so
+ * rapid edits collapse into a single embedding compute.
+ *
+ * Why subscribe here rather than inside db.ts: it keeps the embeddings
+ * feature opt-in (the worker only starts if isEmbeddingsEnabled()) and avoids
+ * a circular dependency between db.ts and embeddings-worker.ts.
+ */
+function startEmbeddingsWatcher(): void {
+  onTrackerEvent((event) => {
+    if (
+      event.type === "work_item.created" ||
+      event.type === "work_item.updated" ||
+      event.type === "work_item.moved"
+    ) {
+      if (event.work_item_id) enqueueEmbeddingRefresh(event.work_item_id);
+    }
+  });
 }
 
 /**
