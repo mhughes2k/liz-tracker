@@ -963,11 +963,11 @@ Groups are **not a first-class entity** — they are regular work items that hav
 
 ## Dashboard UI Code Organization
 
-The dashboard is a single vanilla JS file wrapped in an IIFE. No frameworks. The source is split into `src/ui/core.html` (~19k lines) + `src/ui/spaces/*.js` (per-space plugin files), assembled into `src/ui/index.html` by `scripts/build-ui.js`. Run `npm run build:ui` after editing UI files.
+The dashboard is a single vanilla JS file wrapped in an IIFE. No frameworks. The source is split into `src/ui/core.html` (~22k lines) + `src/ui/spaces/*.js` (per-space plugin files), assembled into `src/ui/index.html` by `scripts/build-ui.js`. Run `npm run build:ui` after editing UI files.
 
 ### Navigation
 
-The code is organized into ~70 sections, each marked with a comment header:
+The code is organized into ~76 sections, each marked with a comment header:
 ```js
 // ── Section Name ──
 ```
@@ -975,7 +975,7 @@ When adding new features, always add a section header. Use grep for `// ──` 
 
 ### Shared Helpers & Constants
 
-Reusable utilities are in the **"Shared Helpers"** section (line ~11464). Check here before writing new utility code:
+Reusable utilities are in the **"Shared Helpers"** section (line ~12455). Check here before writing new utility code:
 
 | Helper | Purpose |
 | --- | --- |
@@ -990,7 +990,7 @@ Reusable utilities are in the **"Shared Helpers"** section (line ~11464). Check 
 | `buildOpencodeUrl(sessionId, dir)` | Build OpenCode deep link URL |
 | `base64UrlEncode(str)` | Encode string to base64url (for OpenCode directory paths) |
 
-Shared constants (defined near the top of the JS, line ~10724):
+Shared constants (defined near the top of the JS, line ~11174):
 
 | Constant | Purpose |
 | --- | --- |

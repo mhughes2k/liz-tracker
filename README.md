@@ -49,7 +49,7 @@ brainstorming → clarification → approved → in_development → in_review �
 
 ### AI Agent Integration
 
-Any MCP-compatible AI agent can manage your tracker programmatically via 50+ tools — create items, update status, add comments, manage travel segments, update engagement milestones, and more. Connect your agent to the MCP endpoint and it can work alongside you.
+Any MCP-compatible AI agent can manage your tracker programmatically via 65+ tools — create items, update status, add comments, propose batched changes, find semantically similar items, manage travel segments, update engagement milestones, and more. Connect your agent to the MCP endpoint and it can work alongside you.
 
 ### AI Orchestrator
 
@@ -77,6 +77,11 @@ The orchestrator:
 - **Comments and discussion** — threaded comments on any item, with emoji reactions and inline CriticMarkup in Song and Text spaces
 - **Attachments** — upload files and images to any item, including paste-from-clipboard support
 - **Dependencies** — link items that block each other
+- **Typed links** — relate items with typed relations (relates_to, duplicates, parent_of, etc.); KEY-N mentions in titles and descriptions auto-create links
+- **Groups** — turn any item into a group by adding `parent_of` links to other items; groups inherit state/comments/search for free, support drag-reorder, multi-select "Group as new item", cross-project membership, and kanban progress mini-bars ("12/15 done")
+- **Refactor primitives** — merge multiple items into one, split one item into many, or bulk-edit labels/priority/state across a selection in a single transaction (with version snapshots for reversibility)
+- **Semantic discovery** — embeddings power a Smart Related panel that surfaces similar items, plus optional Merge Candidates and Topics views; suggestions can be confirmed or dismissed (dismissals remembered so they don't return)
+- **Proposals** — agents stage batches of multi-action suggestions (merges, splits, bulk updates, etc.) for human review; nothing executes until a human applies them
 - **Cover images** — visual cover art for Song and Travel items
 - **Deep links** — shareable URLs that open directly to any item, with Open Graph meta tags for rich link previews in iMessage, Slack, etc.
 - **Activity log** — unified timeline of all mutations (state changes, comments, description edits, attachments) with actor attribution and filtering
@@ -142,12 +147,15 @@ On first run, an API token is auto-generated and saved to `store/auth_token`. Se
 src/
 ├── index.ts          # Entry point
 ├── config.ts         # Environment configuration
-├── db.ts             # SQLite database layer (schema, CRUD, migrations)
+├── db.ts             # SQLite database layer (schema, CRUD, migrations, activity log, links, proposals, embeddings)
 ├── api.ts            # HTTP server — REST API + static files + MCP routing + OG meta tag injection
-├── mcp-server.ts     # MCP tool definitions (50+ tools, including dynamic space plugin tools)
+├── mcp-server.ts     # MCP tool definitions (65+ tools, including dynamic space plugin tools)
 ├── orchestrator.ts   # AI orchestrator — dispatches work to coding sessions, monitors progress
 ├── session-runner.ts # Session runner — direct Claude Code execution via Agent SDK
 ├── runner-types.ts   # Shared types for runner stdio JSON protocol
+├── runner-output.ts  # Runner output helpers (truncation, arg summaries, unified diffs)
+├── embeddings.ts     # Embedding provider abstraction (Voyage, local/mock); vector math
+├── embeddings-worker.ts # Debounced refresh queue, nightly neighbour/drift/clustering job
 ├── logger.ts         # Pino logger
 ├── spaces/           # Space plugin backends (types, registry, per-space logic)
 │   ├── types.ts      # SpacePlugin interface
@@ -232,6 +240,50 @@ Write endpoints require `Authorization: Bearer <token>`. Read endpoints are unau
 | `POST` | `/api/v1/items/:id/watchers` | Add a watcher |
 | `DELETE` | `/api/v1/items/:id/watchers/:entity` | Remove a watcher |
 
+### Typed Links and Groups
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/api/v1/items/:id/links` | List typed links for an item (query: `?relation=`) |
+| `POST` | `/api/v1/items/:id/links` | Add a typed link (`{to_item_id, relation, note?}`) |
+| `DELETE` | `/api/v1/items/:id/links/:linkId` | Remove a typed link |
+| `POST` | `/api/v1/items/:id/links/:linkId/confirm` | Promote an embedding-suggested link to a manual link |
+| `GET` | `/api/v1/items/:id/children` | List children + parent (for items with `parent_of` links) |
+| `PATCH` | `/api/v1/items/:id/children/reorder` | Reorder children (`{child_ids: [...]}`) |
+| `POST` | `/api/v1/items/group` | Create a new group from selected items (`{title, child_item_ids, description?, target_project_id?}`) |
+
+### Refactor and Bulk Operations
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/api/v1/items/merge` | Merge N source items into a target (single transaction, reversible) |
+| `POST` | `/api/v1/items/:id/split` | Split one item into N children with optional regex-based comment extraction |
+| `PATCH` | `/api/v1/items/bulk` | Bulk-update many items in one transaction (labels, priority, assignee, state, project move, add_links) |
+
+### Embeddings and Semantic Discovery
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/api/v1/items/:id/similar` | Top-K semantically similar items + drift score |
+| `GET` | `/api/v1/embeddings/status` | Aggregate stats (counts, provider, thresholds, last neighbour run) |
+| `POST` | `/api/v1/embeddings/recompute` | Re-enqueue items for embedding (admin) |
+| `GET` | `/api/v1/embeddings/merge-candidates` | Global high-similarity pairs |
+| `GET` | `/api/v1/embeddings/topics` | All clusters with members |
+| `PATCH` | `/api/v1/embeddings/clusters/:id/label` | Rename a cluster |
+| `POST` | `/api/v1/embeddings/tombstones` | Record "not duplicates" so the pair won't be re-proposed |
+| `GET` | `/api/v1/embeddings/tombstones` | List all tombstones |
+
+### Proposals
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/api/v1/proposals` | Stage a new proposal (`{title, summary?, expires_in_days?, actions: [...]}`) |
+| `GET` | `/api/v1/proposals` | List proposals (`?status=&since=&limit=`) |
+| `GET` | `/api/v1/proposals/:id` | Get a proposal with all actions |
+| `PATCH` | `/api/v1/proposals/:id/actions/:action_id` | Accept or reject a single action |
+| `POST` | `/api/v1/proposals/:id/apply` | Apply accepted actions (human-class actors only) |
+| `DELETE` | `/api/v1/proposals/:id` | Reject the entire proposal |
+
 ### Space-Specific Endpoints
 
 | Method | Path | Description |
@@ -309,9 +361,9 @@ Write endpoints require `Authorization: Bearer <token>`. Read endpoints are unau
 
 ## MCP Server
 
-The MCP endpoint at `/mcp` (Streamable HTTP, stateless) exposes 50+ tools for AI agents. Connect any MCP-compatible client to `http://localhost:1000/mcp`.
+The MCP endpoint at `/mcp` (Streamable HTTP, stateless) exposes 65+ tools for AI agents. Connect any MCP-compatible client to `http://localhost:1000/mcp`.
 
-Tools cover: project and item CRUD, state transitions, comments, comment reactions, watchers, dependencies, attachments, orchestrator control (dispatch, abort, emergency stop, safe restart), cover images, agent config validation, agent reference documentation, and all space-specific operations (scheduled TODOs/IGNORE rules, engagement milestones/contacts/quotes/comms/settings, travel segments/trips).
+Tools cover: project and item CRUD, state transitions, comments, comment reactions, watchers, dependencies, typed links, groups (list children, create group), refactor primitives (merge, split, bulk update), batch proposals (propose, apply, list, get), semantic similarity (find similar), attachments, orchestrator control (dispatch, abort, emergency stop, safe restart), cover images, agent config validation, agent reference documentation, and all space-specific operations (scheduled TODOs/IGNORE rules, engagement milestones/contacts/quotes/comms/settings, travel segments/trips).
 
 ## AI Orchestrator Setup
 
