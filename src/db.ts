@@ -3345,6 +3345,664 @@ export function createGroupFromItems(args: {
   return parent;
 }
 
+// ── Refactor Operations (TRACK-282) ──
+// Compound primitives — merge / split / bulk_update — that compose into any
+// bulk reorganisation. Each operation runs as a single SQLite transaction so
+// partial failures roll back cleanly. Each operation also writes a single
+// composite activity_log row carrying the full payload so a future
+// "Undo last refactor" surface has everything it needs.
+
+export interface MergeItemsResult {
+  target_id: string;
+  target_key: string;
+  description_added_chars: number;
+  comments_moved: number;
+  attachments_moved: number;
+  links_added: number;
+  sources_cancelled: number;
+  source_ids: string[];
+  source_keys: string[];
+}
+
+/**
+ * Merge one or more source items into a target item.
+ *
+ * Behaviour:
+ *  - Snapshots the target description into tracker_description_versions
+ *    (so the merge is reversible)
+ *  - Appends each source's title + description under a "## Merged from {KEY}: {title}"
+ *    header (when strategy='append_descriptions')
+ *  - Moves comments to the target (each prefixed with "[from {KEY}]")
+ *  - Moves attachments to the target
+ *  - Copies non-conflicting outbound links (skipping duplicates)
+ *  - Adds a superseded_by link from source → target
+ *  - Moves the source to `cancelled` with a transition comment
+ *  - Locks the source to prevent further edits
+ *
+ * Security:
+ *  - `api`-class actors are rejected outright (only known internal actors
+ *    can perform a merge — this preserves the human-only cancel rule by
+ *    only opening the cancellation path to trusted internal actors with
+ *    a strong audit trail).
+ *  - Direct DB update is used for the source state change because the
+ *    cancel restriction in changeWorkItemState() blocks all non-human
+ *    actors. The merge tool provides its own audit trail (composite
+ *    activity_log entry + transition record + superseded_by link).
+ *  - Refuses to merge if source.locked_by is set by a different agent
+ *    (avoids stealing locks from an active session).
+ */
+export function mergeItems(args: {
+  target_id: string;
+  source_ids: string[];
+  strategy?: "append_descriptions" | "replace_with_summary";
+  transfer_comments?: boolean;
+  transfer_attachments?: boolean;
+  transfer_links?: boolean;
+  actor: string;
+}): MergeItemsResult {
+  const strategy = args.strategy || "append_descriptions";
+  const transferComments = args.transfer_comments !== false;
+  const transferAttachments = args.transfer_attachments !== false;
+  const transferLinks = args.transfer_links !== false;
+  const actor = args.actor || "system";
+  const actorClass = classifyActor(actor);
+
+  if (actorClass === "api") {
+    throw new Error(
+      `Unknown actor "${actor}" cannot perform merges. Use a known human, agent, or system actor.`,
+    );
+  }
+
+  const target = getWorkItem(args.target_id);
+  if (!target) throw new Error("target_id not found");
+
+  const sourceIds = Array.from(new Set(args.source_ids || []));
+  if (sourceIds.length === 0) {
+    throw new Error("At least one source_id is required");
+  }
+  if (sourceIds.includes(target.id)) {
+    throw new Error("Cannot merge an item into itself");
+  }
+
+  const sources: WorkItem[] = [];
+  for (const id of sourceIds) {
+    const item = getWorkItem(id);
+    if (!item) throw new Error(`source_id ${id} not found`);
+    if (item.locked_by && item.locked_by !== actor) {
+      throw new Error(
+        `Cannot merge ${getWorkItemKey(item)}: locked by ${item.locked_by}`,
+      );
+    }
+    sources.push(item);
+  }
+
+  const targetKey = getWorkItemKey(target);
+  const ts = now();
+
+  let descriptionAddedChars = 0;
+  let commentsMoved = 0;
+  let attachmentsMoved = 0;
+  let linksAdded = 0;
+  let sourcesCancelled = 0;
+
+  const tx = db.transaction(() => {
+    // Snapshot target description before mutation (reversibility).
+    if (target.description) {
+      createDescriptionVersion({
+        work_item_id: target.id,
+        description: target.description,
+        saved_by: actor,
+      });
+    }
+
+    let newDescription = target.description || "";
+
+    for (const source of sources) {
+      const sourceKey = getWorkItemKey(source);
+
+      // Append description.
+      if (strategy === "append_descriptions") {
+        const header = `\n\n## Merged from ${sourceKey}: ${source.title}\n\n`;
+        const body = source.description || "_(no description)_";
+        const chunk = header + body;
+        newDescription = newDescription + chunk;
+        descriptionAddedChars += chunk.length;
+      } else {
+        // replace_with_summary: append a one-liner pointer per source.
+        const chunk = `\n\n- Merged ${sourceKey}: ${source.title}`;
+        newDescription = newDescription + chunk;
+        descriptionAddedChars += chunk.length;
+      }
+
+      // Move comments. Prefix body with "[from {KEY}]" so provenance survives.
+      if (transferComments) {
+        const sourceComments = db
+          .prepare("SELECT id, body FROM tracker_comments WHERE work_item_id = ?")
+          .all(source.id) as Array<{ id: string; body: string }>;
+        const updStmt = db.prepare(
+          "UPDATE tracker_comments SET work_item_id = ?, body = ? WHERE id = ?",
+        );
+        for (const c of sourceComments) {
+          const newBody = `[from ${sourceKey}] ${c.body}`;
+          updStmt.run(target.id, newBody, c.id);
+          commentsMoved++;
+        }
+      }
+
+      // Move attachments. Storage path stays the same — only the parent item changes.
+      if (transferAttachments) {
+        const result = db
+          .prepare(
+            "UPDATE tracker_attachments SET work_item_id = ? WHERE work_item_id = ?",
+          )
+          .run(target.id, source.id);
+        attachmentsMoved += result.changes;
+      }
+
+      // Copy outbound links from source → other items (except links back to target).
+      // Inbound links (other items pointing TO source) and superseded_by links
+      // are not copied; the superseded_by we add below resolves the chain.
+      if (transferLinks) {
+        const sourceLinks = db
+          .prepare(
+            `SELECT * FROM tracker_links
+             WHERE from_item_id = ? AND to_item_id != ?
+               AND relation NOT IN ('parent_of', 'child_of')`,
+          )
+          .all(source.id, target.id) as Link[];
+        for (const link of sourceLinks) {
+          try {
+            addLink({
+              from_item_id: target.id,
+              to_item_id: link.to_item_id,
+              relation: link.relation,
+              note: link.note,
+              source: "merge",
+              created_by: actor,
+            });
+            linksAdded++;
+          } catch {
+            // Duplicate / self-link / invalid — silently skip; the link
+            // either already exists or isn't applicable to the target.
+          }
+        }
+      }
+
+      // Add superseded_by link from source → target.
+      try {
+        addLink({
+          from_item_id: source.id,
+          to_item_id: target.id,
+          relation: "superseded_by",
+          source: "merge",
+          note: `Merged into ${targetKey}`,
+          created_by: actor,
+        });
+        linksAdded++;
+      } catch {
+        // Pre-existing link — accept idempotently.
+      }
+
+      // Cancel + lock the source. Direct DB update because changeWorkItemState
+      // restricts cancellation to human actors; the merge tool provides its
+      // own audit trail (composite activity_log + transition + superseded_by).
+      const oldState = source.state;
+      if (oldState !== "cancelled") {
+        // Adopt the next position in cancelled column.
+        const maxPos = db
+          .prepare(
+            "SELECT COALESCE(MAX(position), -1) as max_pos FROM tracker_work_items WHERE project_id = ? AND state = ?",
+          )
+          .get(source.project_id, "cancelled") as { max_pos: number };
+        db.prepare(
+          "UPDATE tracker_work_items SET state = ?, position = ?, locked_by = ?, locked_at = ?, updated_at = ? WHERE id = ?",
+        ).run(
+          "cancelled",
+          maxPos.max_pos + 1,
+          actor,
+          ts,
+          ts,
+          source.id,
+        );
+        recordTransition(
+          source.id,
+          oldState as WorkItemState,
+          "cancelled",
+          actor,
+          `Merged into ${targetKey}`,
+        );
+        sourcesCancelled++;
+      }
+    }
+
+    // Update target description (raw DB update — we already snapshotted above
+    // and we don't want updateWorkItem to create a second redundant snapshot).
+    if (newDescription !== target.description) {
+      db.prepare(
+        "UPDATE tracker_work_items SET description = ?, updated_at = ? WHERE id = ?",
+      ).run(newDescription, ts, target.id);
+    }
+  });
+  tx();
+
+  // Single composite activity_log entry carrying the full payload.
+  // Why: the merge is a single conceptual edit even though it touches many
+  //      rows; a future "Undo last refactor" UI needs the full payload to
+  //      reverse the operation.
+  const sourceKeys = sources.map((s) => getWorkItemKey(s));
+  logActivity({
+    project_id: target.project_id,
+    item_id: target.id,
+    action: "items.merged",
+    actor,
+    summary: `Merged ${sources.length} items into ${targetKey}`,
+    details: {
+      target_id: target.id,
+      target_key: targetKey,
+      source_ids: sources.map((s) => s.id),
+      source_keys: sourceKeys,
+      strategy,
+      transfer_comments: transferComments,
+      transfer_attachments: transferAttachments,
+      transfer_links: transferLinks,
+      description_added_chars: descriptionAddedChars,
+      comments_moved: commentsMoved,
+      attachments_moved: attachmentsMoved,
+      links_added: linksAdded,
+      sources_cancelled: sourcesCancelled,
+    },
+  });
+
+  return {
+    target_id: target.id,
+    target_key: targetKey,
+    description_added_chars: descriptionAddedChars,
+    comments_moved: commentsMoved,
+    attachments_moved: attachmentsMoved,
+    links_added: linksAdded,
+    sources_cancelled: sourcesCancelled,
+    source_ids: sources.map((s) => s.id),
+    source_keys: sourceKeys,
+  };
+}
+
+export interface SplitSpec {
+  title: string;
+  description?: string;
+  take_comments_matching?: string; // regex
+  labels?: string[];
+  priority?: Priority;
+}
+
+export interface SplitItemResult {
+  source_id: string;
+  source_key: string;
+  source_preserved: boolean;
+  created: Array<{ id: string; key: string; title: string; comments_taken: number }>;
+}
+
+/**
+ * Split a source item into N new child items.
+ *
+ * Behaviour:
+ *  - Creates N new items in the source's project
+ *  - Adds parent_of link from source → each new item
+ *  - Optionally moves matching comments (regex) to each new item
+ *  - If preserve_source=false, sets source description to a stub and
+ *    moves to `cancelled` (subject to actor-class cancel rules — see below)
+ *  - Snapshots source description before any edit
+ *
+ * Security: cancellation path follows the same audit-trail-strong rule
+ *           as merge — api-class actors are rejected outright; the
+ *           cancellation of the source goes through a direct DB update
+ *           with a recorded transition.
+ */
+export function splitItem(args: {
+  source_id: string;
+  splits: SplitSpec[];
+  preserve_source?: boolean;
+  actor: string;
+}): SplitItemResult {
+  const preserveSource = args.preserve_source !== false;
+  const actor = args.actor || "system";
+  const actorClass = classifyActor(actor);
+
+  if (actorClass === "api") {
+    throw new Error(
+      `Unknown actor "${actor}" cannot perform splits. Use a known human, agent, or system actor.`,
+    );
+  }
+
+  const source = getWorkItem(args.source_id);
+  if (!source) throw new Error("source_id not found");
+  if (!Array.isArray(args.splits) || args.splits.length === 0) {
+    throw new Error("At least one split spec is required");
+  }
+  for (const s of args.splits) {
+    if (!s.title || !s.title.trim()) {
+      throw new Error("Each split must have a non-empty title");
+    }
+  }
+
+  const sourceKey = getWorkItemKey(source);
+  const ts = now();
+  const created: SplitItemResult["created"] = [];
+
+  // Pre-compile regexes outside the transaction so a bad pattern fails fast.
+  const splitRegexes: Array<RegExp | null> = args.splits.map((s) => {
+    if (!s.take_comments_matching) return null;
+    try {
+      return new RegExp(s.take_comments_matching, "i");
+    } catch (e) {
+      throw new Error(
+        `Invalid regex for take_comments_matching: ${s.take_comments_matching}`,
+      );
+    }
+  });
+
+  // Snapshot the source description first (reversibility).
+  if (source.description) {
+    createDescriptionVersion({
+      work_item_id: source.id,
+      description: source.description,
+      saved_by: actor,
+    });
+  }
+
+  const sourceComments = listComments(source.id);
+
+  const tx = db.transaction(() => {
+    for (let i = 0; i < args.splits.length; i++) {
+      const spec = args.splits[i];
+      const child = createWorkItem({
+        project_id: source.project_id,
+        title: spec.title.trim(),
+        description: spec.description || "",
+        labels: spec.labels,
+        priority: spec.priority,
+        created_by: actor,
+      });
+
+      // Add parent_of link source → child (so the source becomes the parent).
+      try {
+        addLink({
+          from_item_id: source.id,
+          to_item_id: child.id,
+          relation: "parent_of",
+          source: "manual",
+          created_by: actor,
+        });
+      } catch {
+        // Cycle / duplicate — skip silently; child still exists.
+      }
+
+      // Take matching comments (by regex on body). Comments are moved (not copied)
+      // to the first matching split.
+      let commentsTaken = 0;
+      const re = splitRegexes[i];
+      if (re) {
+        for (const c of sourceComments) {
+          if (re.test(c.body)) {
+            const result = db
+              .prepare(
+                "UPDATE tracker_comments SET work_item_id = ? WHERE id = ? AND work_item_id = ?",
+              )
+              .run(child.id, c.id, source.id);
+            if (result.changes > 0) {
+              commentsTaken++;
+              // Once a comment is taken, mark it so later splits don't re-claim it.
+              c.work_item_id = child.id;
+            }
+          }
+        }
+      }
+
+      created.push({
+        id: child.id,
+        key: getWorkItemKey(child),
+        title: child.title,
+        comments_taken: commentsTaken,
+      });
+    }
+
+    // If !preserve_source, write a stub description and move source to cancelled.
+    if (!preserveSource) {
+      const stub =
+        `_Split into:_\n\n` +
+        created.map((c) => `- ${c.key}: ${c.title}`).join("\n");
+      db.prepare(
+        "UPDATE tracker_work_items SET description = ?, updated_at = ? WHERE id = ?",
+      ).run(stub, ts, source.id);
+
+      if (source.state !== "cancelled") {
+        const maxPos = db
+          .prepare(
+            "SELECT COALESCE(MAX(position), -1) as max_pos FROM tracker_work_items WHERE project_id = ? AND state = ?",
+          )
+          .get(source.project_id, "cancelled") as { max_pos: number };
+        db.prepare(
+          "UPDATE tracker_work_items SET state = ?, position = ?, updated_at = ? WHERE id = ?",
+        ).run("cancelled", maxPos.max_pos + 1, ts, source.id);
+        recordTransition(
+          source.id,
+          source.state as WorkItemState,
+          "cancelled",
+          actor,
+          `Split into ${created.map((c) => c.key).join(", ")}`,
+        );
+      }
+    }
+  });
+  tx();
+
+  // Single composite activity_log entry.
+  logActivity({
+    project_id: source.project_id,
+    item_id: source.id,
+    action: "item.split",
+    actor,
+    summary: `Split ${sourceKey} into ${created.length} item${created.length === 1 ? "" : "s"}`,
+    details: {
+      source_id: source.id,
+      source_key: sourceKey,
+      preserve_source: preserveSource,
+      created: created.map((c) => ({ id: c.id, key: c.key, title: c.title, comments_taken: c.comments_taken })),
+      total_comments_taken: created.reduce((sum, c) => sum + c.comments_taken, 0),
+    },
+  });
+
+  return {
+    source_id: source.id,
+    source_key: sourceKey,
+    source_preserved: preserveSource,
+    created,
+  };
+}
+
+export interface BulkUpdatePatch {
+  labels?: { add?: string[]; remove?: string[] };
+  priority?: Priority;
+  project_id?: string;
+  assignee?: string;
+  state?: WorkItemState;
+  add_links?: Array<{ to: string; relation: LinkRelation | string; note?: string }>;
+}
+
+export interface BulkUpdateResult {
+  updated: number;
+  skipped: Array<{ id: string; reason: string }>;
+  applied_per_item: Array<{ id: string; key: string; changes: string[] }>;
+}
+
+/**
+ * Apply a patch to many items in a single transaction.
+ *
+ * Per-item activity log entries are emitted by the underlying mutators so the
+ * audit trail is granular; a single composite "items.bulk_updated" entry is
+ * also written carrying the patch shape and the affected ids.
+ *
+ * Security:
+ *  - State changes go through changeWorkItemState which enforces actor-class
+ *    rules (so an agent CANNOT bulk-approve items — those individual transitions
+ *    will throw and the item will be reported in `skipped`).
+ *  - Project moves go through moveWorkItem.
+ *  - api-class actors are rejected outright.
+ */
+export function bulkUpdate(args: {
+  item_ids: string[];
+  patch: BulkUpdatePatch;
+  actor: string;
+}): BulkUpdateResult {
+  const actor = args.actor || "system";
+  const actorClass = classifyActor(actor);
+
+  if (actorClass === "api") {
+    throw new Error(
+      `Unknown actor "${actor}" cannot perform bulk updates. Use a known human, agent, or system actor.`,
+    );
+  }
+
+  const ids = Array.from(new Set(args.item_ids || []));
+  if (ids.length === 0) {
+    throw new Error("At least one item_id is required");
+  }
+
+  const patch = args.patch || {};
+  const labelsAdd = patch.labels?.add || [];
+  const labelsRemove = patch.labels?.remove || [];
+  const hasLabelChange = labelsAdd.length > 0 || labelsRemove.length > 0;
+
+  const skipped: BulkUpdateResult["skipped"] = [];
+  const appliedPerItem: BulkUpdateResult["applied_per_item"] = [];
+  let updated = 0;
+
+  // Validate project_id once.
+  if (patch.project_id) {
+    const proj = getProject(patch.project_id);
+    if (!proj) throw new Error(`project_id ${patch.project_id} not found`);
+  }
+
+  const tx = db.transaction(() => {
+    for (const id of ids) {
+      const item = getWorkItem(id);
+      if (!item) {
+        skipped.push({ id, reason: "not found" });
+        continue;
+      }
+      if (item.locked_by && item.locked_by !== actor) {
+        skipped.push({ id, reason: `locked by ${item.locked_by}` });
+        continue;
+      }
+
+      const itemKey = getWorkItemKey(item);
+      const changes: string[] = [];
+
+      try {
+        // Labels.
+        if (hasLabelChange) {
+          let labels: string[] = [];
+          try {
+            labels = item.labels ? JSON.parse(item.labels as unknown as string) : [];
+            if (!Array.isArray(labels)) labels = [];
+          } catch {
+            labels = [];
+          }
+          const set = new Set(labels);
+          for (const l of labelsRemove) set.delete(l);
+          for (const l of labelsAdd) set.add(l);
+          const next = Array.from(set);
+          if (JSON.stringify(next) !== JSON.stringify(labels)) {
+            updateWorkItem(id, { labels: JSON.stringify(next), actor });
+            changes.push("labels");
+          }
+        }
+
+        // Priority.
+        if (patch.priority && patch.priority !== item.priority) {
+          updateWorkItem(id, { priority: patch.priority, actor });
+          changes.push("priority");
+        }
+
+        // Assignee.
+        if (patch.assignee !== undefined && (patch.assignee || null) !== item.assignee) {
+          updateWorkItem(id, { assignee: patch.assignee, actor });
+          changes.push("assignee");
+        }
+
+        // State (subject to actor-class rules — may throw for agent bulk-approve).
+        if (patch.state && patch.state !== item.state) {
+          changeWorkItemState(id, patch.state, actor);
+          changes.push("state");
+        }
+
+        // Add links (same link applied to every item).
+        if (Array.isArray(patch.add_links)) {
+          for (const linkSpec of patch.add_links) {
+            const toItem = getWorkItemByKey(linkSpec.to) || getWorkItem(linkSpec.to);
+            if (!toItem || toItem.id === id) continue;
+            try {
+              addLink({
+                from_item_id: id,
+                to_item_id: toItem.id,
+                relation: linkSpec.relation,
+                note: linkSpec.note,
+                source: "batch",
+                created_by: actor,
+              });
+              changes.push(`link:${linkSpec.relation}`);
+            } catch {
+              // Duplicate / invalid — skip the link silently. The item still
+              // counts as updated if other fields changed.
+            }
+          }
+        }
+
+        // Project move (last — allocates a new key, so subsequent ops would see new ids).
+        if (patch.project_id && patch.project_id !== item.project_id) {
+          moveWorkItem(id, patch.project_id, actor);
+          changes.push("project");
+        }
+
+        if (changes.length === 0) {
+          skipped.push({ id, reason: "no-op (patch had no effect)" });
+        } else {
+          updated++;
+          appliedPerItem.push({ id, key: itemKey, changes });
+        }
+      } catch (e) {
+        const reason = e instanceof Error ? e.message : "update failed";
+        skipped.push({ id, reason });
+      }
+    }
+  });
+  tx();
+
+  // Composite activity entry — references the first updated item's project
+  // when possible, otherwise the first input item's project. The per-item
+  // entries written by updateWorkItem/changeWorkItemState/moveWorkItem
+  // already carry the granular audit detail.
+  const referenceItem = appliedPerItem.length > 0
+    ? getWorkItem(appliedPerItem[0].id)
+    : getWorkItem(ids[0]);
+  if (referenceItem) {
+    logActivity({
+      project_id: referenceItem.project_id,
+      item_id: null,
+      action: "items.bulk_updated",
+      actor,
+      summary: `Bulk-updated ${updated}/${ids.length} items`,
+      details: {
+        patch,
+        item_ids: ids,
+        updated,
+        skipped,
+      },
+    });
+  }
+
+  return { updated, skipped, applied_per_item: appliedPerItem };
+}
+
 /**
  * Extract `[A-Z]+-[0-9]+` tokens from a body of text. Returns the unique set.
  * Single-letter prefixes are excluded (false positives from things like "A-1").

@@ -10879,7 +10879,93 @@
     <div class="multi-select-bar" id="multiSelectBar" style="display:none">
       <span class="selection-count" id="multiSelectCount">0 selected</span>
       <button class="btn btn-primary btn-sm" id="multiSelectGroup">Group as new item</button>
+      <button class="btn btn-ghost btn-sm" id="multiSelectMerge">Merge into…</button>
+      <button class="btn btn-ghost btn-sm" id="multiSelectSplit">Split…</button>
+      <button class="btn btn-ghost btn-sm" id="multiSelectBulk">Bulk edit…</button>
       <button class="btn btn-ghost btn-sm" id="multiSelectCancel">Cancel</button>
+    </div>
+
+    <!-- TRACK-282: Merge items modal -->
+    <div class="modal-overlay" id="mergeModal">
+      <div class="modal" style="max-width: 560px">
+        <div class="modal-header">
+          <h2>Merge items</h2>
+          <button class="btn-icon detail-close" id="mergeModalClose">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div id="mergeModalSummary" style="margin-bottom:12px;font-size:0.85rem;color:var(--text-dim)"></div>
+          <label style="display:block;font-size:0.85rem;color:var(--text-dim);margin-bottom:4px">Target (the one that survives)</label>
+          <select id="mergeModalTarget" style="width:100%;margin-bottom:12px"></select>
+          <label style="display:block;font-size:0.85rem;color:var(--text-dim);margin-bottom:4px">Description strategy</label>
+          <select id="mergeModalStrategy" style="width:100%;margin-bottom:12px">
+            <option value="append_descriptions" selected>Append source descriptions to target</option>
+            <option value="replace_with_summary">Keep target description as-is</option>
+          </select>
+          <label style="display:block;font-size:0.85rem;color:var(--text-dim);margin-bottom:8px"><input type="checkbox" id="mergeModalComments" checked /> Transfer comments from sources</label>
+          <label style="display:block;font-size:0.85rem;color:var(--text-dim);margin-bottom:8px"><input type="checkbox" id="mergeModalAttachments" checked /> Transfer attachments from sources</label>
+          <label style="display:block;font-size:0.85rem;color:var(--text-dim);margin-bottom:8px"><input type="checkbox" id="mergeModalLinks" checked /> Copy outbound typed links from sources</label>
+          <div style="margin-top:12px;font-size:0.8rem;color:var(--text-dim)">Source items will be cancelled and a <strong>superseded_by</strong> link will be added pointing to the target. The target's description is snapshotted first — you can revert via the version history.</div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-ghost btn-sm" id="mergeModalCancel">Cancel</button>
+          <button class="btn btn-primary btn-sm" id="mergeModalSubmit">Merge</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- TRACK-282: Split item modal -->
+    <div class="modal-overlay" id="splitModal">
+      <div class="modal" style="max-width: 620px">
+        <div class="modal-header">
+          <h2>Split item</h2>
+          <button class="btn-icon detail-close" id="splitModalClose">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div id="splitModalSummary" style="margin-bottom:12px;font-size:0.85rem;color:var(--text-dim)"></div>
+          <div id="splitModalRows" style="display:flex;flex-direction:column;gap:8px;margin-bottom:12px"></div>
+          <button class="btn btn-ghost btn-sm" id="splitModalAddRow" type="button">+ Add child</button>
+          <div style="margin-top:12px">
+            <label style="display:block;font-size:0.85rem;color:var(--text-dim);margin-bottom:4px"><input type="checkbox" id="splitModalPreserve" checked /> Keep source item (stub) — uncheck to cancel it after splitting</label>
+          </div>
+          <div style="margin-top:8px;font-size:0.8rem;color:var(--text-dim)">Each child becomes a new work item linked via <strong>parent_of</strong> from the source. Use a regex per row to pull matching comments off the source onto that child.</div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-ghost btn-sm" id="splitModalCancel">Cancel</button>
+          <button class="btn btn-primary btn-sm" id="splitModalSubmit">Split</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- TRACK-282: Bulk edit modal -->
+    <div class="modal-overlay" id="bulkModal">
+      <div class="modal" style="max-width: 560px">
+        <div class="modal-header">
+          <h2>Bulk edit</h2>
+          <button class="btn-icon detail-close" id="bulkModalClose">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div id="bulkModalSummary" style="margin-bottom:12px;font-size:0.85rem;color:var(--text-dim)"></div>
+          <div style="display:grid;grid-template-columns:auto 1fr;gap:8px 12px;align-items:center;font-size:0.85rem">
+            <label>Add labels</label>
+            <input type="text" id="bulkModalLabelsAdd" placeholder="comma-separated" />
+            <label>Remove labels</label>
+            <input type="text" id="bulkModalLabelsRemove" placeholder="comma-separated" />
+            <label>Priority</label>
+            <select id="bulkModalPriority"><option value="">— no change —</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="urgent">urgent</option></select>
+            <label>Assignee</label>
+            <input type="text" id="bulkModalAssignee" placeholder="leave blank for no change" />
+            <label>State</label>
+            <select id="bulkModalState"><option value="">— no change —</option><option value="brainstorming">brainstorming</option><option value="clarification">clarification</option><option value="approved">approved</option><option value="in_development">in_development</option><option value="in_review">in_review</option><option value="testing">testing</option><option value="needs_input">needs_input</option><option value="done">done</option><option value="cancelled">cancelled</option></select>
+            <label>Move to project</label>
+            <select id="bulkModalProject"><option value="">— no change —</option></select>
+          </div>
+          <div style="margin-top:12px;font-size:0.8rem;color:var(--text-dim)">Only humans can move items to <strong>approved</strong> or <strong>cancelled</strong>. Locked items are skipped.</div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-ghost btn-sm" id="bulkModalCancel">Cancel</button>
+          <button class="btn btn-primary btn-sm" id="bulkModalSubmit">Apply</button>
+        </div>
+      </div>
     </div>
 
     <!-- Comment Quick-Reply Bottom Sheet -->
@@ -17530,8 +17616,219 @@
         document.addEventListener('keydown', (e) => {
           if (e.key !== 'Escape') return;
           if ($('#groupModal')?.classList.contains('open')) return;
+          if ($('#mergeModal')?.classList.contains('open')) return;
+          if ($('#splitModal')?.classList.contains('open')) return;
+          if ($('#bulkModal')?.classList.contains('open')) return;
           if (multiSelectIds.size > 0) {
             clearMultiSelect();
+          }
+        });
+
+        // ── Refactor primitives: Merge / Split / Bulk edit (TRACK-282) ──
+
+        function getSelectedMetas() {
+          return Array.from(multiSelectIds)
+            .map((id) => cardMetaCache.get(id))
+            .filter(Boolean);
+        }
+
+        // Merge
+        $('#multiSelectMerge')?.addEventListener('click', () => {
+          if (multiSelectIds.size < 2) {
+            toast('Select at least 2 items to merge', 'error');
+            return;
+          }
+          openMergeModal();
+        });
+
+        function openMergeModal() {
+          const modal = $('#mergeModal');
+          if (!modal) return;
+          const metas = getSelectedMetas();
+          const summaryEl = $('#mergeModalSummary');
+          const targetSel = $('#mergeModalTarget');
+          summaryEl.innerHTML = 'Merging <strong>' + metas.length + '</strong> items. Pick the one that survives — the others will be cancelled.';
+          targetSel.innerHTML = '';
+          metas.forEach((m) => {
+            const opt = document.createElement('option');
+            opt.value = m.id;
+            opt.textContent = (m.key ? m.key + ' — ' : '') + (m.title || '(untitled)');
+            targetSel.appendChild(opt);
+          });
+          modal.classList.add('open');
+        }
+
+        function closeMergeModal() { $('#mergeModal')?.classList.remove('open'); }
+        $('#mergeModalClose')?.addEventListener('click', closeMergeModal);
+        $('#mergeModalCancel')?.addEventListener('click', closeMergeModal);
+
+        $('#mergeModalSubmit')?.addEventListener('click', async () => {
+          const targetId = $('#mergeModalTarget').value;
+          if (!targetId) { toast('Pick a target', 'error'); return; }
+          const sourceIds = Array.from(multiSelectIds).filter((id) => id !== targetId);
+          if (sourceIds.length === 0) { toast('Select at least 1 source item', 'error'); return; }
+          try {
+            const result = await apiPost('/items/merge', {
+              target_id: targetId,
+              source_ids: sourceIds,
+              strategy: $('#mergeModalStrategy').value,
+              transfer_comments: $('#mergeModalComments').checked,
+              transfer_attachments: $('#mergeModalAttachments').checked,
+              transfer_links: $('#mergeModalLinks').checked,
+              actor: 'dashboard',
+            });
+            if (result.error) { toast(result.error, 'error'); return; }
+            toast('Merged ' + (result.merged_source_ids?.length || 0) + ' item(s) into target', 'success');
+            closeMergeModal();
+            clearMultiSelect();
+            refreshCurrentView();
+            openDetail(result.target_id || targetId);
+          } catch (e) {
+            toast('Merge failed: ' + (e?.message || e), 'error');
+          }
+        });
+
+        // Split
+        $('#multiSelectSplit')?.addEventListener('click', () => {
+          if (multiSelectIds.size !== 1) {
+            toast('Select exactly 1 item to split', 'error');
+            return;
+          }
+          openSplitModal();
+        });
+
+        function renderSplitRow(idx) {
+          const div = document.createElement('div');
+          div.className = 'split-row';
+          div.style.cssText = 'display:grid;grid-template-columns:1fr 1fr auto;gap:6px;align-items:center';
+          div.innerHTML =
+            '<input type="text" class="split-title" placeholder="Child #' + (idx + 1) + ' title" />' +
+            '<input type="text" class="split-regex" placeholder="Comment regex (optional)" />' +
+            '<button class="btn btn-ghost btn-sm split-remove" type="button">×</button>';
+          div.querySelector('.split-remove').addEventListener('click', () => div.remove());
+          return div;
+        }
+
+        function openSplitModal() {
+          const modal = $('#splitModal');
+          if (!modal) return;
+          const meta = getSelectedMetas()[0];
+          if (!meta) return;
+          $('#splitModalSummary').innerHTML = 'Splitting <strong>' + esc(meta.key || meta.id) + '</strong> — ' + esc(meta.title || '(untitled)');
+          const rows = $('#splitModalRows');
+          rows.innerHTML = '';
+          rows.appendChild(renderSplitRow(0));
+          rows.appendChild(renderSplitRow(1));
+          $('#splitModalPreserve').checked = true;
+          modal.classList.add('open');
+        }
+
+        function closeSplitModal() { $('#splitModal')?.classList.remove('open'); }
+        $('#splitModalClose')?.addEventListener('click', closeSplitModal);
+        $('#splitModalCancel')?.addEventListener('click', closeSplitModal);
+        $('#splitModalAddRow')?.addEventListener('click', () => {
+          const rows = $('#splitModalRows');
+          if (rows) rows.appendChild(renderSplitRow(rows.children.length));
+        });
+
+        $('#splitModalSubmit')?.addEventListener('click', async () => {
+          const sourceId = Array.from(multiSelectIds)[0];
+          if (!sourceId) return;
+          const rows = Array.from($('#splitModalRows').querySelectorAll('.split-row'));
+          const splits = [];
+          for (const row of rows) {
+            const title = row.querySelector('.split-title').value.trim();
+            const regex = row.querySelector('.split-regex').value.trim();
+            if (!title) continue;
+            splits.push({ title, comment_regex: regex || undefined });
+          }
+          if (splits.length === 0) { toast('Add at least one child with a title', 'error'); return; }
+          try {
+            const result = await apiPost('/items/' + sourceId + '/split', {
+              splits,
+              preserve_source: $('#splitModalPreserve').checked,
+              actor: 'dashboard',
+            });
+            if (result.error) { toast(result.error, 'error'); return; }
+            toast('Split into ' + (result.created_item_ids?.length || splits.length) + ' new item(s)', 'success');
+            closeSplitModal();
+            clearMultiSelect();
+            refreshCurrentView();
+            openDetail(sourceId);
+          } catch (e) {
+            toast('Split failed: ' + (e?.message || e), 'error');
+          }
+        });
+
+        // Bulk edit
+        $('#multiSelectBulk')?.addEventListener('click', () => {
+          if (multiSelectIds.size < 1) {
+            toast('Select at least 1 item', 'error');
+            return;
+          }
+          openBulkModal();
+        });
+
+        function openBulkModal() {
+          const modal = $('#bulkModal');
+          if (!modal) return;
+          const metas = getSelectedMetas();
+          $('#bulkModalSummary').innerHTML = 'Applying changes to <strong>' + metas.length + '</strong> item(s)';
+          $('#bulkModalLabelsAdd').value = '';
+          $('#bulkModalLabelsRemove').value = '';
+          $('#bulkModalPriority').value = '';
+          $('#bulkModalAssignee').value = '';
+          $('#bulkModalState').value = '';
+          const projSel = $('#bulkModalProject');
+          projSel.innerHTML = '<option value="">— no change —</option>';
+          (projectsCache || []).forEach((p) => {
+            const opt = document.createElement('option');
+            opt.value = p.id;
+            opt.textContent = p.name || p.key || p.id.substring(0, 8);
+            projSel.appendChild(opt);
+          });
+          modal.classList.add('open');
+        }
+
+        function closeBulkModal() { $('#bulkModal')?.classList.remove('open'); }
+        $('#bulkModalClose')?.addEventListener('click', closeBulkModal);
+        $('#bulkModalCancel')?.addEventListener('click', closeBulkModal);
+
+        $('#bulkModalSubmit')?.addEventListener('click', async () => {
+          const ids = Array.from(multiSelectIds);
+          if (ids.length === 0) return;
+          const labelsAdd = $('#bulkModalLabelsAdd').value.split(',').map((s) => s.trim()).filter(Boolean);
+          const labelsRemove = $('#bulkModalLabelsRemove').value.split(',').map((s) => s.trim()).filter(Boolean);
+          const priority = $('#bulkModalPriority').value;
+          const assignee = $('#bulkModalAssignee').value.trim();
+          const state = $('#bulkModalState').value;
+          const projectId = $('#bulkModalProject').value;
+          const patch = {};
+          if (labelsAdd.length || labelsRemove.length) {
+            patch.labels = {};
+            if (labelsAdd.length) patch.labels.add = labelsAdd;
+            if (labelsRemove.length) patch.labels.remove = labelsRemove;
+          }
+          if (priority) patch.priority = priority;
+          if (assignee) patch.assignee = assignee;
+          if (state) patch.state = state;
+          if (projectId) patch.project_id = projectId;
+          if (Object.keys(patch).length === 0) { toast('Nothing to apply', 'error'); return; }
+          try {
+            const result = await apiPatch('/items/bulk', {
+              item_ids: ids,
+              patch,
+              actor: 'dashboard',
+            });
+            if (result.error) { toast(result.error, 'error'); return; }
+            const u = result.updated_item_ids?.length || 0;
+            const s = result.skipped?.length || 0;
+            toast('Updated ' + u + ' item(s)' + (s > 0 ? ' (' + s + ' skipped)' : ''), s > 0 ? 'warning' : 'success');
+            closeBulkModal();
+            clearMultiSelect();
+            refreshCurrentView();
+          } catch (e) {
+            toast('Bulk update failed: ' + (e?.message || e), 'error');
           }
         });
 

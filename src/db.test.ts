@@ -41,6 +41,9 @@ import {
   getParentItem,
   getChildCountsBatch,
   createGroupFromItems,
+  mergeItems,
+  splitItem,
+  bulkUpdate,
   createComment,
   deleteComment,
   updateComment,
@@ -3006,5 +3009,437 @@ describe('Groups (parent_of)', () => {
       const children = getChildItems(parent.id);
       expect(children).toHaveLength(2);
     });
+  });
+});
+
+// ── Refactor Operations (TRACK-282) ─────────────────────────────────────────
+
+describe('mergeItems (TRACK-282)', () => {
+  let projectId: string;
+
+  beforeEach(() => {
+    _initTestTrackerDatabase();
+    const p = createProject({ name: 'Merge Test', short_name: 'MT' });
+    projectId = p.id;
+  });
+
+  it('moves comments, attachments, links and cancels sources', () => {
+    const target = createWorkItem({
+      project_id: projectId,
+      title: 'Target',
+      description: 'Original target body.',
+    });
+    const sourceA = createWorkItem({
+      project_id: projectId,
+      title: 'Source A',
+      description: 'Body A',
+    });
+    const sourceB = createWorkItem({
+      project_id: projectId,
+      title: 'Source B',
+      description: 'Body B',
+    });
+
+    createComment({ work_item_id: sourceA.id, author: 'alice', body: 'A1' });
+    createComment({ work_item_id: sourceA.id, author: 'alice', body: 'A2' });
+    createComment({ work_item_id: sourceB.id, author: 'bob', body: 'B1' });
+
+    createAttachment({
+      work_item_id: sourceA.id,
+      filename: 'a.txt',
+      mime_type: 'text/plain',
+      size_bytes: 10,
+      storage_path: '/tmp/a.txt',
+    });
+
+    // Outbound link from source A to a third item.
+    const other = createWorkItem({ project_id: projectId, title: 'Other' });
+    addLink({
+      from_item_id: sourceA.id,
+      to_item_id: other.id,
+      relation: 'relates_to',
+      created_by: 'dashboard',
+    });
+
+    const result = mergeItems({
+      target_id: target.id,
+      source_ids: [sourceA.id, sourceB.id],
+      actor: 'dashboard',
+    });
+
+    expect(result.comments_moved).toBe(3);
+    expect(result.attachments_moved).toBe(1);
+    expect(result.sources_cancelled).toBe(2);
+    expect(result.links_added).toBeGreaterThanOrEqual(2); // superseded_by * 2 + relates_to
+
+    // Target has both source descriptions appended.
+    const updatedTarget = getWorkItem(target.id)!;
+    expect(updatedTarget.description).toContain('Merged from MT-2: Source A');
+    expect(updatedTarget.description).toContain('Body A');
+    expect(updatedTarget.description).toContain('Body B');
+
+    // Sources cancelled.
+    expect(getWorkItem(sourceA.id)!.state).toBe('cancelled');
+    expect(getWorkItem(sourceB.id)!.state).toBe('cancelled');
+
+    // Sources locked.
+    expect(getWorkItem(sourceA.id)!.locked_by).toBe('dashboard');
+
+    // Comments transferred to target with prefix.
+    const targetComments = listComments(target.id);
+    expect(targetComments).toHaveLength(3);
+    expect(targetComments.every((c) => c.body.startsWith('[from MT-'))).toBe(true);
+
+    // superseded_by link exists from each source to target.
+    const linksFromA = listLinks(sourceA.id, 'superseded_by');
+    expect(linksFromA.some((l) => l.other_item_id === target.id)).toBe(true);
+  });
+
+  it('snapshots target description into version history before edit', () => {
+    const target = createWorkItem({
+      project_id: projectId,
+      title: 'Target',
+      description: 'Original target body.',
+    });
+    const source = createWorkItem({ project_id: projectId, title: 'S', description: 'X' });
+
+    const versionsBefore = listDescriptionVersions(target.id);
+    mergeItems({ target_id: target.id, source_ids: [source.id], actor: 'dashboard' });
+    const versionsAfter = listDescriptionVersions(target.id);
+
+    expect(versionsAfter.length).toBe(versionsBefore.length + 1);
+    expect(versionsAfter[versionsAfter.length - 1].description).toBe('Original target body.');
+  });
+
+  it('rolls back atomically on failure', () => {
+    const target = createWorkItem({
+      project_id: projectId,
+      title: 'Target',
+      description: 'orig',
+    });
+    const source = createWorkItem({ project_id: projectId, title: 'Source' });
+
+    // Inject a source id that doesn't exist alongside a valid one — the
+    // initial validation pass should throw and leave the DB untouched.
+    expect(() => mergeItems({
+      target_id: target.id,
+      source_ids: [source.id, 'nonexistent-id'],
+      actor: 'dashboard',
+    })).toThrow();
+
+    // Target description unchanged.
+    expect(getWorkItem(target.id)!.description).toBe('orig');
+    // Source unchanged.
+    expect(getWorkItem(source.id)!.state).not.toBe('cancelled');
+  });
+
+  it('refuses merges from api-class actors', () => {
+    const target = createWorkItem({ project_id: projectId, title: 'T' });
+    const source = createWorkItem({ project_id: projectId, title: 'S' });
+    expect(() => mergeItems({
+      target_id: target.id,
+      source_ids: [source.id],
+      actor: 'unknown-bot',
+    })).toThrow(/cannot perform merges/i);
+  });
+
+  it('refuses to merge a locked source not owned by the actor', () => {
+    const target = createWorkItem({ project_id: projectId, title: 'T' });
+    const source = createWorkItem({ project_id: projectId, title: 'S' });
+    lockWorkItem(source.id, 'OtherAgent');
+    expect(() => mergeItems({
+      target_id: target.id,
+      source_ids: [source.id],
+      actor: 'dashboard',
+    })).toThrow(/locked by OtherAgent/);
+  });
+
+  it('refuses to merge an item into itself', () => {
+    const t = createWorkItem({ project_id: projectId, title: 'T' });
+    expect(() => mergeItems({
+      target_id: t.id,
+      source_ids: [t.id],
+      actor: 'dashboard',
+    })).toThrow(/itself/i);
+  });
+
+  it('agent actor can perform a merge', () => {
+    const target = createWorkItem({ project_id: projectId, title: 'T' });
+    const source = createWorkItem({ project_id: projectId, title: 'S' });
+    const result = mergeItems({
+      target_id: target.id,
+      source_ids: [source.id],
+      actor: 'Coder',
+    });
+    expect(result.sources_cancelled).toBe(1);
+    expect(getWorkItem(source.id)!.state).toBe('cancelled');
+  });
+
+  it('writes a composite activity_log entry', () => {
+    const target = createWorkItem({ project_id: projectId, title: 'T' });
+    const source = createWorkItem({ project_id: projectId, title: 'S' });
+    mergeItems({
+      target_id: target.id,
+      source_ids: [source.id],
+      actor: 'dashboard',
+    });
+    const entries = listActivity({ action: 'items.merged' });
+    expect(entries.length).toBeGreaterThan(0);
+    const raw = entries[0].details;
+    const details = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    expect(details.target_key).toBe('MT-1');
+    expect(details.source_keys).toEqual(['MT-2']);
+  });
+});
+
+describe('splitItem (TRACK-282)', () => {
+  let projectId: string;
+
+  beforeEach(() => {
+    _initTestTrackerDatabase();
+    const p = createProject({ name: 'Split Test', short_name: 'ST' });
+    projectId = p.id;
+  });
+
+  it('creates new items linked via parent_of', () => {
+    const source = createWorkItem({
+      project_id: projectId,
+      title: 'Source',
+      description: 'original body',
+    });
+    const result = splitItem({
+      source_id: source.id,
+      splits: [
+        { title: 'Part one', description: 'one' },
+        { title: 'Part two', description: 'two' },
+        { title: 'Part three' },
+      ],
+      actor: 'dashboard',
+    });
+
+    expect(result.created).toHaveLength(3);
+
+    const children = getChildItems(source.id);
+    expect(children).toHaveLength(3);
+    expect(children.map((c) => c.title).sort()).toEqual(['Part one', 'Part three', 'Part two']);
+  });
+
+  it('moves comments matching the regex per split', () => {
+    const source = createWorkItem({ project_id: projectId, title: 'Source' });
+    createComment({ work_item_id: source.id, author: 'a', body: 'frontend bug' });
+    createComment({ work_item_id: source.id, author: 'a', body: 'backend issue' });
+    createComment({ work_item_id: source.id, author: 'a', body: 'unrelated' });
+
+    const result = splitItem({
+      source_id: source.id,
+      splits: [
+        { title: 'Frontend', take_comments_matching: 'frontend' },
+        { title: 'Backend', take_comments_matching: 'backend' },
+      ],
+      actor: 'dashboard',
+    });
+
+    expect(result.created[0].comments_taken).toBe(1);
+    expect(result.created[1].comments_taken).toBe(1);
+
+    // Source still has the unrelated comment.
+    expect(listComments(source.id)).toHaveLength(1);
+    expect(listComments(result.created[0].id)[0].body).toBe('frontend bug');
+    expect(listComments(result.created[1].id)[0].body).toBe('backend issue');
+  });
+
+  it('preserves source by default', () => {
+    const source = createWorkItem({ project_id: projectId, title: 'Source' });
+    splitItem({
+      source_id: source.id,
+      splits: [{ title: 'Child' }],
+      actor: 'dashboard',
+    });
+    expect(getWorkItem(source.id)!.state).not.toBe('cancelled');
+  });
+
+  it('cancels source and writes stub when preserve_source=false', () => {
+    const source = createWorkItem({
+      project_id: projectId,
+      title: 'Source',
+      description: 'original',
+    });
+    const result = splitItem({
+      source_id: source.id,
+      splits: [{ title: 'A' }, { title: 'B' }],
+      preserve_source: false,
+      actor: 'dashboard',
+    });
+    const updated = getWorkItem(source.id)!;
+    expect(updated.state).toBe('cancelled');
+    expect(updated.description).toContain('Split into');
+    expect(updated.description).toContain(result.created[0].key);
+  });
+
+  it('snapshots source description before edit', () => {
+    const source = createWorkItem({
+      project_id: projectId,
+      title: 'Source',
+      description: 'original body',
+    });
+    splitItem({
+      source_id: source.id,
+      splits: [{ title: 'X' }],
+      preserve_source: false,
+      actor: 'dashboard',
+    });
+    const versions = listDescriptionVersions(source.id);
+    expect(versions.some((v) => v.description === 'original body')).toBe(true);
+  });
+
+  it('refuses invalid regex', () => {
+    const source = createWorkItem({ project_id: projectId, title: 'S' });
+    expect(() => splitItem({
+      source_id: source.id,
+      splits: [{ title: 'X', take_comments_matching: '[invalid' }],
+      actor: 'dashboard',
+    })).toThrow(/regex/i);
+  });
+
+  it('refuses splits from api-class actors', () => {
+    const source = createWorkItem({ project_id: projectId, title: 'S' });
+    expect(() => splitItem({
+      source_id: source.id,
+      splits: [{ title: 'X' }],
+      actor: 'unknown',
+    })).toThrow(/cannot perform splits/i);
+  });
+});
+
+describe('bulkUpdate (TRACK-282)', () => {
+  let projectId: string;
+
+  beforeEach(() => {
+    _initTestTrackerDatabase();
+    const p = createProject({ name: 'Bulk Test', short_name: 'BT' });
+    projectId = p.id;
+  });
+
+  it('updates priority on many items', () => {
+    const items = [1, 2, 3].map((n) =>
+      createWorkItem({ project_id: projectId, title: `Item ${n}` }),
+    );
+    const result = bulkUpdate({
+      item_ids: items.map((i) => i.id),
+      patch: { priority: 'high' },
+      actor: 'dashboard',
+    });
+    expect(result.updated).toBe(3);
+    for (const i of items) {
+      expect(getWorkItem(i.id)!.priority).toBe('high');
+    }
+  });
+
+  it('adds and removes labels with set semantics', () => {
+    const a = createWorkItem({
+      project_id: projectId,
+      title: 'A',
+      labels: ['old', 'keep'],
+    });
+    const b = createWorkItem({
+      project_id: projectId,
+      title: 'B',
+      labels: ['old'],
+    });
+    bulkUpdate({
+      item_ids: [a.id, b.id],
+      patch: { labels: { add: ['new'], remove: ['old'] } },
+      actor: 'dashboard',
+    });
+    const aL = JSON.parse(getWorkItem(a.id)!.labels as unknown as string);
+    const bL = JSON.parse(getWorkItem(b.id)!.labels as unknown as string);
+    expect(aL).toEqual(expect.arrayContaining(['keep', 'new']));
+    expect(aL).not.toContain('old');
+    expect(bL).toContain('new');
+    expect(bL).not.toContain('old');
+  });
+
+  it('blocks agent actor from bulk-approving', () => {
+    const items = [1, 2].map((n) =>
+      createWorkItem({
+        project_id: projectId,
+        title: `Item ${n}`,
+        requires_code: true,
+      }),
+    );
+    const result = bulkUpdate({
+      item_ids: items.map((i) => i.id),
+      patch: { state: 'approved' },
+      actor: 'Coder',
+    });
+    expect(result.updated).toBe(0);
+    expect(result.skipped).toHaveLength(2);
+    expect(result.skipped[0].reason).toMatch(/human|approve/i);
+  });
+
+  it('moves items to another project', () => {
+    const other = createProject({ name: 'Other', short_name: 'OB' });
+    const items = [1, 2].map((n) =>
+      createWorkItem({ project_id: projectId, title: `Item ${n}` }),
+    );
+    const result = bulkUpdate({
+      item_ids: items.map((i) => i.id),
+      patch: { project_id: other.id },
+      actor: 'dashboard',
+    });
+    expect(result.updated).toBe(2);
+    for (const i of items) {
+      expect(getWorkItem(i.id)!.project_id).toBe(other.id);
+    }
+  });
+
+  it('skips items locked by another agent', () => {
+    const a = createWorkItem({ project_id: projectId, title: 'A' });
+    const b = createWorkItem({ project_id: projectId, title: 'B' });
+    lockWorkItem(b.id, 'OtherAgent');
+
+    const result = bulkUpdate({
+      item_ids: [a.id, b.id],
+      patch: { priority: 'high' },
+      actor: 'dashboard',
+    });
+    expect(result.updated).toBe(1);
+    expect(result.skipped[0].id).toBe(b.id);
+    expect(result.skipped[0].reason).toMatch(/locked/);
+  });
+
+  it('refuses bulk updates from api-class actors', () => {
+    const a = createWorkItem({ project_id: projectId, title: 'A' });
+    expect(() => bulkUpdate({
+      item_ids: [a.id],
+      patch: { priority: 'low' },
+      actor: 'random',
+    })).toThrow(/cannot perform bulk updates/i);
+  });
+
+  it('reports no-op items as skipped', () => {
+    const a = createWorkItem({
+      project_id: projectId,
+      title: 'A',
+      priority: 'high',
+    });
+    const result = bulkUpdate({
+      item_ids: [a.id],
+      patch: { priority: 'high' },
+      actor: 'dashboard',
+    });
+    expect(result.updated).toBe(0);
+    expect(result.skipped[0].reason).toMatch(/no-op/);
+  });
+
+  it('writes a composite activity_log entry', () => {
+    const a = createWorkItem({ project_id: projectId, title: 'A' });
+    bulkUpdate({
+      item_ids: [a.id],
+      patch: { priority: 'high' },
+      actor: 'dashboard',
+    });
+    const entries = listActivity({ action: 'items.bulk_updated' });
+    expect(entries.length).toBeGreaterThan(0);
   });
 });

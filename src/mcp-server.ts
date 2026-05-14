@@ -39,6 +39,9 @@ import {
   getChildItems,
   getParentItem,
   createGroupFromItems,
+  mergeItems,
+  splitItem,
+  bulkUpdate,
   createComment,
   listComments,
   toggleReaction,
@@ -855,6 +858,165 @@ function createMcpServer(): McpServer {
           content: [
             { type: "text", text: `Error: ${e instanceof Error ? e.message : "Failed"}` },
           ],
+        };
+      }
+    },
+  );
+
+  // ── Refactor Operations (TRACK-282) ──
+
+  server.tool(
+    "tracker_merge_items",
+    "Merge one or more source items into a target item. Appends source descriptions, moves comments (prefixed with '[from KEY]'), moves attachments, copies outbound links, adds a superseded_by link from each source to the target, and cancels the sources with a transition comment. Single transaction — all or nothing.",
+    {
+      target_id: z.string().describe("Target item ID or display key (the surviving item)"),
+      source_ids: z
+        .array(z.string())
+        .min(1)
+        .describe("Source item IDs or display keys (these get absorbed and cancelled)"),
+      strategy: z
+        .enum(["append_descriptions", "replace_with_summary"])
+        .optional()
+        .describe("How to combine descriptions (default: append_descriptions)"),
+      transfer_comments: z
+        .boolean()
+        .optional()
+        .describe("Move source comments to target (default: true)"),
+      transfer_attachments: z
+        .boolean()
+        .optional()
+        .describe("Move source attachments to target (default: true)"),
+      transfer_links: z
+        .boolean()
+        .optional()
+        .describe("Copy non-conflicting outbound links from sources to target (default: true)"),
+    },
+    async (args) => {
+      try {
+        const targetId = resolveId(args.target_id);
+        const sourceIds = args.source_ids.map(resolveId);
+        const result = mergeItems({
+          target_id: targetId,
+          source_ids: sourceIds,
+          strategy: args.strategy,
+          transfer_comments: args.transfer_comments,
+          transfer_attachments: args.transfer_attachments,
+          transfer_links: args.transfer_links,
+          actor: "Harmoni",
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (e) {
+        return {
+          content: [
+            { type: "text", text: `Error: ${e instanceof Error ? e.message : "Merge failed"}` },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "tracker_split_item",
+    "Split a source item into N new child items. Each split becomes a new work item in the source's project, linked via parent_of. Optionally moves matching comments by regex. If preserve_source=false, the source gets a stub description and is cancelled; otherwise the source remains as a parent. Description versions snapshot before any edit so the split is reversible.",
+    {
+      source_id: z.string().describe("Source item ID or display key (the item being split)"),
+      splits: z
+        .array(
+          z.object({
+            title: z.string().describe("Title for the new child item"),
+            description: z.string().optional().describe("Description for the new child item"),
+            take_comments_matching: z
+              .string()
+              .optional()
+              .describe("Case-insensitive regex; comments whose body matches are moved to this split"),
+            labels: z.array(z.string()).optional().describe("Labels for the new child item"),
+            priority: z
+              .enum(VALID_PRIORITIES)
+              .optional()
+              .describe("Priority for the new child item"),
+          }),
+        )
+        .min(1)
+        .describe("Specs for the new child items"),
+      preserve_source: z
+        .boolean()
+        .optional()
+        .describe("Keep the source as a parent stub (true, default) or cancel it (false)"),
+    },
+    async (args) => {
+      try {
+        const sourceId = resolveId(args.source_id);
+        const result = splitItem({
+          source_id: sourceId,
+          splits: args.splits,
+          preserve_source: args.preserve_source,
+          actor: "Harmoni",
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (e) {
+        return {
+          content: [
+            { type: "text", text: `Error: ${e instanceof Error ? e.message : "Split failed"}` },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "tracker_bulk_update",
+    "Apply a patch to many items in a single transaction. Each per-item change goes through the normal mutators, so actor-class rules still apply (e.g. an agent cannot bulk-approve items — those will appear in `skipped`). Patch fields are all optional; only specified fields are touched. Returns { updated, skipped, applied_per_item }.",
+    {
+      item_ids: z
+        .array(z.string())
+        .min(1)
+        .describe("Item IDs or display keys to update"),
+      patch: z
+        .object({
+          labels: z
+            .object({
+              add: z.array(z.string()).optional(),
+              remove: z.array(z.string()).optional(),
+            })
+            .optional()
+            .describe("Add / remove labels (set semantics — dedups)"),
+          priority: z.enum(VALID_PRIORITIES).optional(),
+          project_id: z
+            .string()
+            .optional()
+            .describe("Move items to another project (allocates new seq_number)"),
+          assignee: z.string().optional(),
+          state: z.enum(VALID_STATES).optional(),
+          add_links: z
+            .array(
+              z.object({
+                to: z.string().describe("Target item ID or display key"),
+                relation: z.enum(VALID_LINK_RELATIONS).describe("Link relation"),
+                note: z.string().optional(),
+              }),
+            )
+            .optional()
+            .describe("Adds these links to every item in item_ids"),
+        })
+        .describe("Patch to apply. Empty patch is a no-op."),
+    },
+    async (args) => {
+      try {
+        const ids = args.item_ids.map(resolveId);
+        const result = bulkUpdate({
+          item_ids: ids,
+          patch: args.patch,
+          actor: "Harmoni",
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (e) {
+        return {
+          content: [
+            { type: "text", text: `Error: ${e instanceof Error ? e.message : "Bulk update failed"}` },
+          ],
+          isError: true,
         };
       }
     },

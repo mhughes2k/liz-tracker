@@ -72,6 +72,9 @@ import {
   getChildCountsBatch,
   reorderChildren,
   createGroupFromItems,
+  mergeItems,
+  splitItem,
+  bulkUpdate,
   createComment,
   listComments,
   getCommentCounts,
@@ -746,7 +749,7 @@ async function handleApiRequest(
     // ── Work Items (direct access) ──
     if (parts[0] === "items") {
       const itemId =
-        parts[1] === "clear-stale-locks" || parts[1] === "recent" || parts[1] === "ai-categorize" || parts[1] === "ai-session-summary" || parts[1] === "group" ? parts[1] : resolveItemId(parts[1]);
+        parts[1] === "clear-stale-locks" || parts[1] === "recent" || parts[1] === "ai-categorize" || parts[1] === "ai-session-summary" || parts[1] === "group" || parts[1] === "merge" || parts[1] === "bulk" ? parts[1] : resolveItemId(parts[1]);
 
       // TRACK-281: POST /items/group — create a new parent item linked via
       // parent_of to the given child items. Used by the multi-select
@@ -793,6 +796,68 @@ async function handleApiRequest(
             res,
             e instanceof Error ? e.message : "Failed to create group",
           );
+        }
+      }
+
+      // TRACK-282: POST /items/merge — merge sources into a target.
+      if (parts.length === 2 && parts[1] === "merge" && method === "POST") {
+        const body = await parseBody(req);
+        if (!body.target_id) return error(res, "target_id is required");
+        if (!Array.isArray(body.source_ids) || body.source_ids.length === 0) {
+          return error(res, "source_ids (non-empty array) is required");
+        }
+        const actor = body.actor ? String(body.actor) : "dashboard";
+        // Resolve display keys to internal IDs (same pattern as /items/group).
+        const targetId = (() => {
+          const s = String(body.target_id);
+          const byKey = getWorkItemByKey(s);
+          return byKey ? byKey.id : s;
+        })();
+        const sourceIds = (body.source_ids as unknown[]).map((raw) => {
+          const s = String(raw);
+          const byKey = getWorkItemByKey(s);
+          return byKey ? byKey.id : s;
+        });
+        try {
+          const result = mergeItems({
+            target_id: targetId,
+            source_ids: sourceIds,
+            strategy: body.strategy as "append_descriptions" | "replace_with_summary" | undefined,
+            transfer_comments: body.transfer_comments as boolean | undefined,
+            transfer_attachments: body.transfer_attachments as boolean | undefined,
+            transfer_links: body.transfer_links as boolean | undefined,
+            actor,
+          });
+          return json(res, result);
+        } catch (e) {
+          return error(res, e instanceof Error ? e.message : "Merge failed");
+        }
+      }
+
+      // TRACK-282: PATCH /items/bulk — bulk-update many items in one transaction.
+      if (parts.length === 2 && parts[1] === "bulk" && method === "PATCH") {
+        const body = await parseBody(req);
+        if (!Array.isArray(body.item_ids) || body.item_ids.length === 0) {
+          return error(res, "item_ids (non-empty array) is required");
+        }
+        if (!body.patch || typeof body.patch !== "object") {
+          return error(res, "patch object is required");
+        }
+        const actor = body.actor ? String(body.actor) : "dashboard";
+        const ids = (body.item_ids as unknown[]).map((raw) => {
+          const s = String(raw);
+          const byKey = getWorkItemByKey(s);
+          return byKey ? byKey.id : s;
+        });
+        try {
+          const result = bulkUpdate({
+            item_ids: ids,
+            patch: body.patch,
+            actor,
+          });
+          return json(res, result);
+        } catch (e) {
+          return error(res, e instanceof Error ? e.message : "Bulk update failed");
         }
       }
 
@@ -1057,6 +1122,26 @@ Extract the structured fields from this description. Return ONLY valid JSON.`;
         if (!item) return error(res, "Work item not found", 404);
         const unlockKey = getWorkItemKey(item);
         return json(res, { ...item, key: unlockKey, url: buildItemUrl(unlockKey) });
+      }
+
+      // TRACK-282: POST /items/:id/split — split this item into N new children.
+      if (parts.length === 3 && parts[2] === "split" && method === "POST") {
+        const body = await parseBody(req);
+        if (!Array.isArray(body.splits) || body.splits.length === 0) {
+          return error(res, "splits (non-empty array) is required");
+        }
+        const actor = body.actor ? String(body.actor) : "dashboard";
+        try {
+          const result = splitItem({
+            source_id: itemId,
+            splits: body.splits as any,
+            preserve_source: body.preserve_source as boolean | undefined,
+            actor,
+          });
+          return json(res, result);
+        } catch (e) {
+          return error(res, e instanceof Error ? e.message : "Split failed");
+        }
       }
 
       // POST /items/:id/dispatch — manually dispatch to OpenCode

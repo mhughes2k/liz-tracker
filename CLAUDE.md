@@ -400,6 +400,9 @@ Write endpoints (POST, PUT, PATCH, DELETE) require a bearer token:
 | `GET` | `/api/v1/settings` | Get tracker-wide settings (coder model/provider/effort + strength tier model IDs). Response includes `_defaults` showing env-var fallbacks |
 | `PATCH` | `/api/v1/settings` | Update tracker-wide settings (empty string = reset to env-var default) |
 | `GET` | `/api/v1/models` | List available Anthropic models (proxied from `https://api.anthropic.com/v1/models`, cached 10min). Requires `ANTHROPIC_API_KEY` |
+| `POST` | `/api/v1/items/merge` | Merge items (TRACK-282). Body `{target_id, source_ids: [...], strategy?, transfer_comments?, transfer_attachments?, transfer_links?, actor?}`. Single transaction, reversible via target description version snapshot. |
+| `POST` | `/api/v1/items/:id/split` | Split one item into N children (TRACK-282). Body `{splits: [{title, description?, comment_regex?, labels?, priority?, target_project_id?}], preserve_source?, actor?}`. Adds parent_of links; optional regex comment extraction. |
+| `PATCH` | `/api/v1/items/bulk` | Bulk-update many items in one transaction (TRACK-282). Body `{item_ids: [...], patch: {labels?: {add, remove}, priority?, assignee?, state?, project_id?, add_links?}, actor?}`. Skips locked items. |
 
 ### MCP Tools
 
@@ -434,6 +437,9 @@ Write endpoints (POST, PUT, PATCH, DELETE) require a bearer token:
 | `tracker_list_attachments` | List all attachments on a work item |
 | `tracker_delete_attachment` | Delete a file attachment |
 | `tracker_list_activity` | List recent activity log entries with optional filters (project, item, action, actor, since) |
+| `tracker_merge_items` | Merge N source items into a target item (single transaction). Snapshots target description, optionally appends source bodies, transfers comments (prefixed `[from KEY]`)/attachments/outbound links, adds `superseded_by` link, cancels sources. Reversible via the target's version history + composite `items.merged` activity log entry. |
+| `tracker_split_item` | Split one source item into N new children. Creates each child as a new item with parent_of link from the source, optional regex pulls matching comments off the source onto the child, optional source cancellation (stub kept by default). Snapshots source description first; activity log entry `item.split`. |
+| `tracker_bulk_update` | Apply a patch to many items in one transaction. Supports labels add/remove (set semantics), priority, assignee, state, project move, and `add_links` (every item gets the link). Locked items are skipped. State changes still go through `changeWorkItemState` — agents cannot bulk-approve. Composite `items.bulk_updated` activity entry. |
 
 **Orchestrator tools:**
 
