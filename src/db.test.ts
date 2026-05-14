@@ -28,6 +28,13 @@ import {
   removeDependency,
   isBlocked,
   getBlockers,
+  addLink,
+  removeLink,
+  removeLinkById,
+  listLinks,
+  extractMentionKeys,
+  reconcileMentionLinks,
+  VALID_LINK_RELATIONS,
   createComment,
   deleteComment,
   updateComment,
@@ -2329,5 +2336,394 @@ describe('tracker-wide settings', () => {
   it('getAllSettings returns empty object when no settings exist', () => {
     const all = getAllSettings();
     expect(Object.keys(all).length).toBe(0);
+  });
+});
+
+// ── Links (TRACK-280) ─────────────────────────────────────────────────────────
+
+describe('Links', () => {
+  let projectId: string;
+  let itemA: string;
+  let itemB: string;
+  let itemC: string;
+
+  beforeEach(() => {
+    _initTestTrackerDatabase();
+    const p = createProject({ name: 'Test', short_name: 'TST' });
+    projectId = p.id;
+    itemA = createWorkItem({ project_id: projectId, title: 'A' }).id;
+    itemB = createWorkItem({ project_id: projectId, title: 'B' }).id;
+    itemC = createWorkItem({ project_id: projectId, title: 'C' }).id;
+  });
+
+  describe('addLink', () => {
+    it('adds a directional link', () => {
+      const link = addLink({
+        from_item_id: itemA,
+        to_item_id: itemB,
+        relation: 'duplicates',
+        created_by: 'dashboard',
+      });
+      expect(link.from_item_id).toBe(itemA);
+      expect(link.to_item_id).toBe(itemB);
+      expect(link.relation).toBe('duplicates');
+      expect(link.symmetric).toBe(0);
+      expect(link.source).toBe('manual');
+    });
+
+    it('marks symmetric relations with symmetric=1', () => {
+      const link = addLink({
+        from_item_id: itemA,
+        to_item_id: itemB,
+        relation: 'relates_to',
+        created_by: 'dashboard',
+      });
+      expect(link.symmetric).toBe(1);
+    });
+
+    it('is idempotent on (from, to, relation)', () => {
+      const a = addLink({
+        from_item_id: itemA,
+        to_item_id: itemB,
+        relation: 'duplicates',
+        created_by: 'dashboard',
+      });
+      const b = addLink({
+        from_item_id: itemA,
+        to_item_id: itemB,
+        relation: 'duplicates',
+        created_by: 'dashboard',
+      });
+      expect(a.id).toBe(b.id);
+    });
+
+    it('symmetric relation: re-adding inverse direction returns existing row', () => {
+      const a = addLink({
+        from_item_id: itemA,
+        to_item_id: itemB,
+        relation: 'relates_to',
+        created_by: 'dashboard',
+      });
+      const b = addLink({
+        from_item_id: itemB,
+        to_item_id: itemA,
+        relation: 'relates_to',
+        created_by: 'dashboard',
+      });
+      expect(a.id).toBe(b.id);
+    });
+
+    it('updates note on idempotent re-add', () => {
+      addLink({
+        from_item_id: itemA,
+        to_item_id: itemB,
+        relation: 'duplicates',
+        created_by: 'dashboard',
+        note: 'first',
+      });
+      const updated = addLink({
+        from_item_id: itemA,
+        to_item_id: itemB,
+        relation: 'duplicates',
+        created_by: 'dashboard',
+        note: 'second',
+      });
+      expect(updated.note).toBe('second');
+    });
+
+    it('rejects self-links', () => {
+      expect(() =>
+        addLink({
+          from_item_id: itemA,
+          to_item_id: itemA,
+          relation: 'relates_to',
+          created_by: 'dashboard',
+        }),
+      ).toThrow(/cannot link to itself/);
+    });
+
+    it('rejects unknown relations', () => {
+      expect(() =>
+        addLink({
+          from_item_id: itemA,
+          to_item_id: itemB,
+          relation: 'bogus',
+          created_by: 'dashboard',
+        }),
+      ).toThrow(/Invalid relation/);
+    });
+
+    it('rejects missing target item', () => {
+      expect(() =>
+        addLink({
+          from_item_id: itemA,
+          to_item_id: 'nonexistent',
+          relation: 'relates_to',
+          created_by: 'dashboard',
+        }),
+      ).toThrow(/not found/);
+    });
+
+    it('writes an activity log entry', () => {
+      addLink({
+        from_item_id: itemA,
+        to_item_id: itemB,
+        relation: 'duplicates',
+        created_by: 'dashboard',
+      });
+      const entries = listActivity({ item_id: itemA, action: 'link.added' });
+      expect(entries).toHaveLength(1);
+      expect(entries[0].summary).toMatch(/duplicates/);
+    });
+  });
+
+  describe('removeLink', () => {
+    it('removes a directional link', () => {
+      addLink({ from_item_id: itemA, to_item_id: itemB, relation: 'duplicates', created_by: 'dashboard' });
+      const ok = removeLink({ from_item_id: itemA, to_item_id: itemB, relation: 'duplicates' });
+      expect(ok).toBe(true);
+      expect(listLinks(itemA)).toHaveLength(0);
+    });
+
+    it('returns false when link does not exist', () => {
+      const ok = removeLink({ from_item_id: itemA, to_item_id: itemB, relation: 'duplicates' });
+      expect(ok).toBe(false);
+    });
+
+    it('symmetric: removes the link regardless of perspective', () => {
+      addLink({ from_item_id: itemA, to_item_id: itemB, relation: 'relates_to', created_by: 'dashboard' });
+      // Remove from the inverse direction — should still work.
+      const ok = removeLink({ from_item_id: itemB, to_item_id: itemA, relation: 'relates_to' });
+      expect(ok).toBe(true);
+      expect(listLinks(itemA)).toHaveLength(0);
+    });
+
+    it('writes an activity log entry on remove', () => {
+      addLink({ from_item_id: itemA, to_item_id: itemB, relation: 'duplicates', created_by: 'dashboard' });
+      removeLink({ from_item_id: itemA, to_item_id: itemB, relation: 'duplicates', actor: 'dashboard' });
+      const entries = listActivity({ item_id: itemA, action: 'link.removed' });
+      expect(entries).toHaveLength(1);
+    });
+  });
+
+  describe('removeLinkById', () => {
+    it('removes a link by its row id', () => {
+      const link = addLink({ from_item_id: itemA, to_item_id: itemB, relation: 'duplicates', created_by: 'dashboard' });
+      const ok = removeLinkById(link.id);
+      expect(ok).toBe(true);
+      expect(listLinks(itemA)).toHaveLength(0);
+    });
+
+    it('returns false for an unknown link id', () => {
+      expect(removeLinkById('nonexistent')).toBe(false);
+    });
+  });
+
+  describe('listLinks', () => {
+    it('returns empty array for items with no links', () => {
+      expect(listLinks(itemA)).toEqual([]);
+    });
+
+    it('returns directional links from the source perspective', () => {
+      addLink({ from_item_id: itemA, to_item_id: itemB, relation: 'duplicates', created_by: 'dashboard' });
+      const fromA = listLinks(itemA);
+      expect(fromA).toHaveLength(1);
+      expect(fromA[0].perspective_relation).toBe('duplicates');
+      expect(fromA[0].other_item_id).toBe(itemB);
+      expect(fromA[0].is_inverse).toBe(false);
+    });
+
+    it('returns the inverse relation when listing from the target perspective', () => {
+      addLink({ from_item_id: itemA, to_item_id: itemB, relation: 'duplicates', created_by: 'dashboard' });
+      const fromB = listLinks(itemB);
+      expect(fromB).toHaveLength(1);
+      expect(fromB[0].perspective_relation).toBe('duplicated_by');
+      expect(fromB[0].other_item_id).toBe(itemA);
+      expect(fromB[0].is_inverse).toBe(true);
+    });
+
+    it('symmetric relation visible from both perspectives without is_inverse', () => {
+      addLink({ from_item_id: itemA, to_item_id: itemB, relation: 'relates_to', created_by: 'dashboard' });
+      const fromA = listLinks(itemA);
+      const fromB = listLinks(itemB);
+      expect(fromA).toHaveLength(1);
+      expect(fromB).toHaveLength(1);
+      expect(fromA[0].perspective_relation).toBe('relates_to');
+      expect(fromB[0].perspective_relation).toBe('relates_to');
+      expect(fromA[0].is_inverse).toBe(false);
+      expect(fromB[0].is_inverse).toBe(false);
+    });
+
+    it('filters by relation', () => {
+      addLink({ from_item_id: itemA, to_item_id: itemB, relation: 'duplicates', created_by: 'dashboard' });
+      addLink({ from_item_id: itemA, to_item_id: itemC, relation: 'relates_to', created_by: 'dashboard' });
+      const dupes = listLinks(itemA, 'duplicates');
+      expect(dupes).toHaveLength(1);
+      expect(dupes[0].other_item_id).toBe(itemB);
+    });
+
+    it('parent_of/child_of inverse expansion', () => {
+      addLink({ from_item_id: itemA, to_item_id: itemB, relation: 'parent_of', created_by: 'dashboard' });
+      const fromB = listLinks(itemB);
+      expect(fromB[0].perspective_relation).toBe('child_of');
+    });
+
+    it('handles many links of mixed relations', () => {
+      addLink({ from_item_id: itemA, to_item_id: itemB, relation: 'duplicates', created_by: 'dashboard' });
+      addLink({ from_item_id: itemA, to_item_id: itemC, relation: 'relates_to', created_by: 'dashboard' });
+      addLink({ from_item_id: itemB, to_item_id: itemA, relation: 'parent_of', created_by: 'dashboard' });
+      const fromA = listLinks(itemA);
+      // 3 visible: A→B (duplicates), A↔C (relates_to), B→A (child_of inverse)
+      expect(fromA).toHaveLength(3);
+    });
+  });
+
+  describe('extractMentionKeys', () => {
+    it('finds standard tracker keys', () => {
+      expect(extractMentionKeys('See TRACK-5 and LIZ-10.')).toEqual(
+        expect.arrayContaining(['TRACK-5', 'LIZ-10']),
+      );
+    });
+
+    it('dedupes repeated keys', () => {
+      const keys = extractMentionKeys('TRACK-5 TRACK-5 TRACK-5');
+      expect(keys).toEqual(['TRACK-5']);
+    });
+
+    it('ignores single-letter prefixes (false positives)', () => {
+      expect(extractMentionKeys('A-1 needs review')).toEqual([]);
+    });
+
+    it('returns empty array for empty input', () => {
+      expect(extractMentionKeys('')).toEqual([]);
+      expect(extractMentionKeys('no keys here')).toEqual([]);
+    });
+
+    it('handles multi-line text', () => {
+      expect(extractMentionKeys('TRACK-1\nTRACK-2\n\nTRACK-3')).toEqual(
+        expect.arrayContaining(['TRACK-1', 'TRACK-2', 'TRACK-3']),
+      );
+    });
+  });
+
+  describe('mention auto-extraction on item create', () => {
+    it('creates mention links to existing items referenced in description', () => {
+      const target = createWorkItem({ project_id: projectId, title: 'Target' });
+      const targetKey = `TST-${target.seq_number}`;
+      const mentioner = createWorkItem({
+        project_id: projectId,
+        title: 'Mentioner',
+        description: `Refs ${targetKey} for context.`,
+      });
+      const links = listLinks(mentioner.id, 'mentions');
+      expect(links).toHaveLength(1);
+      expect(links[0].other_item_id).toBe(target.id);
+      expect(links[0].source).toBe('mention');
+    });
+
+    it('skips self-mentions silently', () => {
+      // Item references its own key in description — should not produce a self-link.
+      // The seq is allocated atomically; we need to peek at the project's next_seq.
+      // Simpler approach: just verify no self-links exist after create.
+      const item = createWorkItem({
+        project_id: projectId,
+        title: 'TST-99 in title',
+        description: 'TST-99 reference',
+      });
+      const links = listLinks(item.id);
+      expect(links.every((l) => l.other_item_id !== item.id)).toBe(true);
+    });
+
+    it('skips unresolved keys (item does not exist)', () => {
+      const item = createWorkItem({
+        project_id: projectId,
+        title: 'Test',
+        description: 'See NOSUCH-99 for details.',
+      });
+      const links = listLinks(item.id, 'mentions');
+      expect(links).toHaveLength(0);
+    });
+  });
+
+  describe('mention auto-extraction on item update', () => {
+    it('adds links when description is updated to reference new items', () => {
+      const target = createWorkItem({ project_id: projectId, title: 'Target' });
+      const targetKey = `TST-${target.seq_number}`;
+      const mentioner = createWorkItem({
+        project_id: projectId,
+        title: 'No refs yet',
+        description: '',
+      });
+      expect(listLinks(mentioner.id, 'mentions')).toHaveLength(0);
+
+      updateWorkItem(mentioner.id, {
+        description: `Now references ${targetKey}.`,
+        actor: 'dashboard',
+      });
+      expect(listLinks(mentioner.id, 'mentions')).toHaveLength(1);
+    });
+
+    it('removes stale mention links when description no longer references them', () => {
+      const target = createWorkItem({ project_id: projectId, title: 'Target' });
+      const targetKey = `TST-${target.seq_number}`;
+      const mentioner = createWorkItem({
+        project_id: projectId,
+        title: 'Mentioner',
+        description: `Initial ${targetKey} ref.`,
+      });
+      expect(listLinks(mentioner.id, 'mentions')).toHaveLength(1);
+
+      updateWorkItem(mentioner.id, {
+        description: 'No more refs.',
+        actor: 'dashboard',
+      });
+      expect(listLinks(mentioner.id, 'mentions')).toHaveLength(0);
+    });
+
+    it('does not remove manual links during mention reconciliation', () => {
+      const target = createWorkItem({ project_id: projectId, title: 'Target' });
+      const mentioner = createWorkItem({
+        project_id: projectId,
+        title: 'Mentioner',
+      });
+
+      addLink({
+        from_item_id: mentioner.id,
+        to_item_id: target.id,
+        relation: 'relates_to',
+        created_by: 'dashboard',
+        source: 'manual',
+      });
+
+      updateWorkItem(mentioner.id, {
+        description: 'No refs here.',
+        actor: 'dashboard',
+      });
+
+      const links = listLinks(mentioner.id, 'relates_to');
+      expect(links).toHaveLength(1);
+    });
+
+    it('reconcileMentionLinks is idempotent', () => {
+      const target = createWorkItem({ project_id: projectId, title: 'Target' });
+      const targetKey = `TST-${target.seq_number}`;
+      const mentioner = createWorkItem({
+        project_id: projectId,
+        title: 'Mentioner',
+        description: `Refs ${targetKey}.`,
+      });
+      reconcileMentionLinks(mentioner.id, 'dashboard');
+      reconcileMentionLinks(mentioner.id, 'dashboard');
+      expect(listLinks(mentioner.id, 'mentions')).toHaveLength(1);
+    });
+  });
+
+  describe('VALID_LINK_RELATIONS', () => {
+    it('exports the expected enum', () => {
+      expect(VALID_LINK_RELATIONS).toContain('relates_to');
+      expect(VALID_LINK_RELATIONS).toContain('duplicates');
+      expect(VALID_LINK_RELATIONS).toContain('parent_of');
+      expect(VALID_LINK_RELATIONS).toContain('mentions');
+    });
   });
 });

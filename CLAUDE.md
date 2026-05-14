@@ -388,6 +388,9 @@ Write endpoints (POST, PUT, PATCH, DELETE) require a bearer token:
 | `GET` | `/api/v1/activity` | List recent activity (global). Query params: `limit`, `offset`, `project_id`, `item_id`, `action`, `actor`, `since`, `search` |
 | `GET` | `/api/v1/projects/:id/activity` | List activity for a specific project |
 | `GET` | `/api/v1/items/:id/activity` | List activity for a specific item |
+| `GET` | `/api/v1/items/:id/links` | List typed links for an item (query: `?relation=`) — normalized to the item's perspective |
+| `POST` | `/api/v1/items/:id/links` | Add a typed link (body: `{ to_item_id, relation, note? }`) |
+| `DELETE` | `/api/v1/items/:id/links/:linkId` | Remove a typed link by its row id |
 | `GET` | `/api/v1/items/:id/session/events` | SSE stream of runner session events (runner mode) |
 | `POST` | `/api/v1/items/:id/session/steer` | Send steering message to running agent (runner mode) |
 | `POST` | `/api/v1/comments/:id/reactions` | Toggle an emoji reaction on a comment (add/remove) |
@@ -421,6 +424,9 @@ Write endpoints (POST, PUT, PATCH, DELETE) require a bearer token:
 | `tracker_add_dependency` | Add a dependency between items |
 | `tracker_remove_dependency` | Remove a dependency |
 | `tracker_get_blockers` | Get unfinished blockers for an item |
+| `tracker_add_link` | Add a typed link between two items (relates_to/duplicates/parent_of/etc.). Cross-project links allowed. |
+| `tracker_remove_link` | Remove a typed link by (from, to, relation). Auto mention links must be removed by editing the description. |
+| `tracker_list_links` | List typed links for an item — normalized to the item's perspective, optional relation filter |
 | `tracker_upload_attachment` | Upload a file attachment (base64-encoded) |
 | `tracker_upload_attachment_from_path` | Upload a local file by path (supports container path translation) |
 | `tracker_list_attachments` | List all attachments on a work item |

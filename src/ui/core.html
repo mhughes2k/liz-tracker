@@ -1412,6 +1412,106 @@
         gap: 6px;
         margin-bottom: 8px;
       }
+      /* TRACK-280: Related links panel */
+      .related-list {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        margin-bottom: 8px;
+      }
+      .related-group-label {
+        font-size: 0.72rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--text-dim);
+        margin-bottom: 4px;
+      }
+      .related-group {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .related-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 8px;
+        background: var(--bg-accent);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        font-size: 0.85rem;
+        cursor: pointer;
+      }
+      .related-row:hover {
+        background: var(--bg);
+      }
+      .related-row .related-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        flex-shrink: 0;
+      }
+      .related-row .related-key {
+        font-weight: 600;
+        color: var(--highlight);
+        flex-shrink: 0;
+      }
+      .related-row .related-title {
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        opacity: 0.85;
+      }
+      .related-row .related-state {
+        font-size: 0.7rem;
+        padding: 1px 5px;
+        border-radius: 3px;
+        opacity: 0.7;
+        flex-shrink: 0;
+      }
+      .related-row .related-source-badge {
+        font-size: 0.65rem;
+        padding: 1px 5px;
+        border-radius: 3px;
+        background: var(--bg);
+        opacity: 0.6;
+        flex-shrink: 0;
+      }
+      .related-row .related-remove {
+        background: none;
+        border: none;
+        color: var(--text-muted);
+        font-size: 1rem;
+        cursor: pointer;
+        padding: 0 2px;
+        line-height: 1;
+      }
+      .related-row .related-remove:hover {
+        color: var(--highlight);
+      }
+      .related-empty {
+        font-size: 0.85rem;
+        color: var(--text-dim);
+        font-style: italic;
+        padding: 4px 0;
+      }
+      .related-add-wrapper {
+        margin-top: 4px;
+      }
+      .search-results-dropdown .search-result-row {
+        padding: 6px 10px;
+        cursor: pointer;
+        border-bottom: 1px solid var(--border);
+        font-size: 0.85rem;
+      }
+      .search-results-dropdown .search-result-row:last-child {
+        border-bottom: none;
+      }
+      .search-results-dropdown .search-result-row:hover,
+      .search-results-dropdown .search-result-row.active {
+        background: var(--bg-accent);
+      }
       .blocker-chip {
         display: inline-flex;
         align-items: center;
@@ -10226,6 +10326,14 @@
             </div>
           </div>
         </div>
+        <!-- TRACK-280: Typed Links panel -->
+        <div class="detail-section" id="relatedSection">
+          <h3>Related <span id="relatedCount" style="opacity:0.5;font-size:0.8rem;font-weight:normal;"></span></h3>
+          <div class="related-list" id="detailRelated"></div>
+          <div class="related-add-wrapper">
+            <button class="btn btn-ghost btn-sm" id="relatedAddBtn">+ Add link</button>
+          </div>
+        </div>
         <div class="markers-done-wrapper">
           <button class="btn btn-ghost markers-opencode-btn" id="markersOpencodeBtn" style="display:none">OpenCode ↗</button>
         </div>
@@ -10540,6 +10648,38 @@
         <div class="modal-footer">
           <button class="btn btn-ghost btn-sm" id="globalSettingsCancel">Cancel</button>
           <button class="btn btn-primary btn-sm" id="globalSettingsSave">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- TRACK-280: Add Link modal -->
+    <div class="modal-overlay" id="addLinkModal">
+      <div class="modal" style="max-width: 520px">
+        <div class="modal-header">
+          <h2>Add Link</h2>
+          <button class="btn-icon detail-close" id="addLinkClose">&times;</button>
+        </div>
+        <div class="modal-body">
+          <label style="display:block;font-size:0.85rem;color:var(--text-dim);margin-bottom:4px">Relation</label>
+          <select id="addLinkRelation" style="width:100%;margin-bottom:12px">
+            <option value="relates_to">relates to</option>
+            <option value="duplicates">duplicates</option>
+            <option value="duplicated_by">duplicated by</option>
+            <option value="supersedes">supersedes</option>
+            <option value="superseded_by">superseded by</option>
+            <option value="parent_of">parent of</option>
+            <option value="child_of">child of</option>
+          </select>
+          <label style="display:block;font-size:0.85rem;color:var(--text-dim);margin-bottom:4px">Search for item</label>
+          <div style="position:relative">
+            <input type="text" id="addLinkSearch" placeholder="Search by key or title..." autocomplete="off" style="width:100%" />
+            <div id="addLinkResults" class="search-results-dropdown" style="display:none;position:absolute;left:0;right:0;top:100%;z-index:10;background:var(--bg-card);border:1px solid var(--border);max-height:260px;overflow-y:auto;border-radius:4px;margin-top:2px"></div>
+          </div>
+          <label style="display:block;font-size:0.85rem;color:var(--text-dim);margin:12px 0 4px">Note (optional)</label>
+          <input type="text" id="addLinkNote" placeholder="Why are these linked?" style="width:100%" />
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-ghost btn-sm" id="addLinkCancel">Cancel</button>
         </div>
       </div>
     </div>
@@ -15957,6 +16097,9 @@
           // Attachments
           renderAttachments(item.attachments || []);
 
+          // TRACK-280: Related links
+          loadRelatedLinks(item.id);
+
           // Session viewer (live SSE feed for runner-mode sessions)
           // Skip re-render if user is actively viewing sessions tab to avoid disrupting SSE/transcript state
           if (activeDetailTab === "sessions") {
@@ -16242,6 +16385,235 @@
             onRemove: null,
           });
         }
+
+        // ── Related Links (TRACK-280) ──
+
+        // Display order + labels for related-panel groups. Groups not in this
+        // list (or with no entries) are not rendered.
+        const RELATED_GROUPS = [
+          { rel: 'relates_to', label: 'Related' },
+          { rel: 'parent_of', label: 'Children' },
+          { rel: 'child_of', label: 'Parent' },
+          { rel: 'duplicates', label: 'Duplicates' },
+          { rel: 'duplicated_by', label: 'Duplicated by' },
+          { rel: 'supersedes', label: 'Supersedes' },
+          { rel: 'superseded_by', label: 'Superseded by' },
+          { rel: 'mentions', label: 'Mentions' },
+          { rel: 'mentioned_by', label: 'Mentioned by' },
+        ];
+
+        async function loadRelatedLinks(itemId) {
+          const listEl = $('#detailRelated');
+          const countEl = $('#relatedCount');
+          if (!listEl) return;
+          listEl.innerHTML = '';
+          countEl.textContent = '';
+          try {
+            const links = await apiGet(`/items/${itemId}/links`);
+            renderRelatedLinks(itemId, links);
+          } catch (e) {
+            listEl.innerHTML = '<div class="related-empty">Failed to load links</div>';
+          }
+        }
+
+        function renderRelatedLinks(itemId, links) {
+          const listEl = $('#detailRelated');
+          const countEl = $('#relatedCount');
+          if (!listEl) return;
+          listEl.innerHTML = '';
+          countEl.textContent = links.length > 0 ? `(${links.length})` : '';
+
+          if (links.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'related-empty';
+            empty.textContent = 'No links yet.';
+            listEl.appendChild(empty);
+            return;
+          }
+
+          const byRelation = new Map();
+          for (const link of links) {
+            const rel = link.perspective_relation;
+            if (!byRelation.has(rel)) byRelation.set(rel, []);
+            byRelation.get(rel).push(link);
+          }
+
+          for (const group of RELATED_GROUPS) {
+            const groupLinks = byRelation.get(group.rel);
+            if (!groupLinks || groupLinks.length === 0) continue;
+
+            const wrap = document.createElement('div');
+            wrap.className = 'related-group';
+            const label = document.createElement('div');
+            label.className = 'related-group-label';
+            label.textContent = group.label;
+            wrap.appendChild(label);
+
+            for (const link of groupLinks) {
+              wrap.appendChild(buildRelatedRow(itemId, link));
+            }
+            listEl.appendChild(wrap);
+          }
+        }
+
+        function buildRelatedRow(currentItemId, link) {
+          const row = document.createElement('div');
+          row.className = 'related-row';
+          const otherProj = projectsCache.find(p => p.id === link.other_item_project_id);
+          const projTheme = otherProj ? (THEME_COLORS[otherProj.theme] || THEME_COLORS.midnight) : THEME_COLORS.midnight;
+          const dot = document.createElement('div');
+          dot.className = 'related-dot';
+          dot.style.background = projTheme.highlight;
+          row.appendChild(dot);
+
+          const keySpan = document.createElement('span');
+          keySpan.className = 'related-key';
+          keySpan.textContent = link.other_item_key || link.other_item_id.substring(0, 8);
+          row.appendChild(keySpan);
+
+          const titleSpan = document.createElement('span');
+          titleSpan.className = 'related-title';
+          titleSpan.textContent = link.other_item_title || '(deleted)';
+          row.appendChild(titleSpan);
+
+          if (link.other_item_state) {
+            const stateColor = STATE_COLORS[link.other_item_state] || '#636e72';
+            const stateSpan = document.createElement('span');
+            stateSpan.className = 'related-state';
+            stateSpan.style.background = stateColor + '22';
+            stateSpan.style.color = stateColor;
+            stateSpan.textContent = STATE_LABELS[link.other_item_state] || link.other_item_state;
+            row.appendChild(stateSpan);
+          }
+
+          // Auto-extracted links display a small "auto" badge and are not user-removable
+          // (the body text owns them; edit the description to remove a mention).
+          const isAuto = link.source === 'mention';
+          if (isAuto) {
+            const badge = document.createElement('span');
+            badge.className = 'related-source-badge';
+            badge.title = 'Auto-extracted from description. Edit the body text to remove.';
+            badge.textContent = 'auto';
+            row.appendChild(badge);
+          } else {
+            const removeBtn = document.createElement('button');
+            removeBtn.className = 'related-remove';
+            removeBtn.title = 'Remove link';
+            removeBtn.textContent = '×';
+            removeBtn.addEventListener('click', async (e) => {
+              e.stopPropagation();
+              try {
+                await apiDelete(`/items/${currentItemId}/links/${encodeURIComponent(link.id)}`);
+                toast('Link removed');
+                loadRelatedLinks(currentItemId);
+              } catch (err) {
+                toast('Failed to remove link: ' + err.message, 'error');
+              }
+            });
+            row.appendChild(removeBtn);
+          }
+
+          // Clicking the row navigates to the other item, switching project if needed.
+          row.addEventListener('click', () => {
+            if (link.other_item_project_id && link.other_item_project_id !== currentProjectId) {
+              switchProject(link.other_item_project_id);
+            }
+            openDetail(link.other_item_id);
+          });
+
+          return row;
+        }
+
+        // Add-link modal logic.
+        let addLinkContextItemId = null;
+        let addLinkSelectedTargetId = null;
+
+        function openAddLinkModal(currentItemId) {
+          addLinkContextItemId = currentItemId;
+          addLinkSelectedTargetId = null;
+          $('#addLinkRelation').value = 'relates_to';
+          $('#addLinkSearch').value = '';
+          $('#addLinkNote').value = '';
+          $('#addLinkResults').innerHTML = '';
+          $('#addLinkResults').style.display = 'none';
+          $('#addLinkModal').classList.add('open');
+          setTimeout(() => $('#addLinkSearch').focus(), 50);
+        }
+
+        function closeAddLinkModal() {
+          $('#addLinkModal').classList.remove('open');
+          addLinkContextItemId = null;
+          addLinkSelectedTargetId = null;
+        }
+
+        async function submitAddLink(targetItemId) {
+          if (!addLinkContextItemId || !targetItemId) return;
+          const relation = $('#addLinkRelation').value;
+          const note = $('#addLinkNote').value.trim() || undefined;
+          try {
+            await apiPost(`/items/${addLinkContextItemId}/links`, {
+              to_item_id: targetItemId,
+              relation,
+              note,
+            });
+            toast('Link added');
+            const ctx = addLinkContextItemId;
+            closeAddLinkModal();
+            loadRelatedLinks(ctx);
+          } catch (e) {
+            toast('Failed to add link: ' + e.message, 'error');
+          }
+        }
+
+        // Wire up the modal once at page load.
+        $('#relatedAddBtn').addEventListener('click', () => {
+          if (detailItemId) openAddLinkModal(detailItemId);
+        });
+        $('#addLinkClose').addEventListener('click', closeAddLinkModal);
+        $('#addLinkCancel').addEventListener('click', closeAddLinkModal);
+        $('#addLinkModal').addEventListener('click', (e) => {
+          if (e.target.id === 'addLinkModal') closeAddLinkModal();
+        });
+
+        let _addLinkSearchDebounce = null;
+        $('#addLinkSearch').addEventListener('input', () => {
+          clearTimeout(_addLinkSearchDebounce);
+          const q = $('#addLinkSearch').value.trim();
+          const resultsEl = $('#addLinkResults');
+          if (q.length < 2) {
+            resultsEl.style.display = 'none';
+            return;
+          }
+          _addLinkSearchDebounce = setTimeout(async () => {
+            try {
+              const params = new URLSearchParams({ q });
+              const isKeySearch = /^[A-Z]+-\d+$/i.test(q);
+              if (currentProjectId && !isKeySearch) params.set('project_id', currentProjectId);
+              const items = await apiGet(`/search?${params}`);
+              const filtered = items.filter(it => it.id !== addLinkContextItemId);
+              if (filtered.length === 0) {
+                resultsEl.innerHTML = '<div class="search-result-row" style="opacity:0.6">No results</div>';
+                resultsEl.style.display = 'block';
+                return;
+              }
+              resultsEl.innerHTML = '';
+              for (const it of filtered.slice(0, 20)) {
+                const proj = projectsCache.find(p => p.id === it.project_id);
+                const projName = proj ? proj.short_name : '???';
+                const itemKey = `${projName}-${it.seq_number}`;
+                const row = document.createElement('div');
+                row.className = 'search-result-row';
+                row.innerHTML = `<strong>${esc(itemKey)}</strong> ${esc(it.title)}`;
+                row.addEventListener('click', () => submitAddLink(it.id));
+                resultsEl.appendChild(row);
+              }
+              resultsEl.style.display = 'block';
+            } catch (e) {
+              resultsEl.innerHTML = '<div class="search-result-row" style="opacity:0.6">Search failed</div>';
+              resultsEl.style.display = 'block';
+            }
+          }, 200);
+        });
 
         // ── Attachments ──
 

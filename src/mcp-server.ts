@@ -32,6 +32,10 @@ import {
   getDependents,
   getBlockers,
   isBlocked,
+  addLink,
+  removeLink,
+  listLinks,
+  VALID_LINK_RELATIONS,
   createComment,
   listComments,
   toggleReaction,
@@ -695,6 +699,84 @@ function createMcpServer(): McpServer {
           return `  - [${bKey}] "${b.title}" [${b.state}] (${b.id})`;
         }).join("\n");
       return { content: [{ type: "text", text: msg }] };
+    },
+  );
+
+  // ── Links (TRACK-280) ──
+
+  server.tool(
+    "tracker_add_link",
+    `Add a typed link between two work items. Relations: ${VALID_LINK_RELATIONS.join(", ")}. ` +
+      `Use 'relates_to' for symmetric soft cross-references; 'duplicates'/'duplicated_by' for merges; ` +
+      `'parent_of'/'child_of' for groupings; 'supersedes'/'superseded_by' for replacements. ` +
+      `Cross-project links are allowed.`,
+    {
+      from_item_id: z.string().describe("Source item (ID or display key e.g. \"TRACK-5\")"),
+      to_item_id: z.string().describe("Target item (ID or display key e.g. \"TRACK-6\")"),
+      relation: z.enum(VALID_LINK_RELATIONS).describe("Relation type"),
+      note: z.string().optional().describe("Optional human-readable note about why these items are linked"),
+    },
+    async (args) => {
+      try {
+        const fromId = resolveId(args.from_item_id);
+        const toId = resolveId(args.to_item_id);
+        const link = addLink({
+          from_item_id: fromId,
+          to_item_id: toId,
+          relation: args.relation,
+          note: args.note,
+          source: "manual",
+          created_by: "Harmoni",
+        });
+        return { content: [{ type: "text", text: JSON.stringify(link, null, 2) }] };
+      } catch (e) {
+        return { content: [{ type: "text", text: `Error: ${e instanceof Error ? e.message : "Failed"}` }] };
+      }
+    },
+  );
+
+  server.tool(
+    "tracker_remove_link",
+    "Remove a typed link between two items by (from, to, relation). Auto-extracted mention links are owned by the body text and should be removed by editing the description, not via this tool.",
+    {
+      from_item_id: z.string().describe("Source item (ID or display key)"),
+      to_item_id: z.string().describe("Target item (ID or display key)"),
+      relation: z.enum(VALID_LINK_RELATIONS).describe("Relation type"),
+    },
+    async (args) => {
+      const fromId = resolveId(args.from_item_id);
+      const toId = resolveId(args.to_item_id);
+      const ok = removeLink({
+        from_item_id: fromId,
+        to_item_id: toId,
+        relation: args.relation,
+        actor: "Harmoni",
+      });
+      return { content: [{ type: "text", text: ok ? "Link removed." : "Error: Link not found." }] };
+    },
+  );
+
+  server.tool(
+    "tracker_list_links",
+    "List all typed links involving an item. Symmetric links and inverse directions are normalized into the item's perspective. Optionally filter by relation.",
+    {
+      item_id: z.string().describe("Work item ID or display key (e.g. \"TRACK-5\")"),
+      relation: z.enum(VALID_LINK_RELATIONS).optional().describe("Filter by relation type"),
+    },
+    async (args) => {
+      const itemId = resolveId(args.item_id);
+      const links = listLinks(itemId, args.relation);
+      // Hydrate each link with the other item's display key + title for easy reading.
+      const hydrated = links.map((l) => {
+        const other = getWorkItem(l.other_item_id);
+        return {
+          ...l,
+          other_item_key: other ? getWorkItemKey(other) : null,
+          other_item_title: other?.title || null,
+          other_item_state: other?.state || null,
+        };
+      });
+      return { content: [{ type: "text", text: JSON.stringify(hydrated, null, 2) }] };
     },
   );
 

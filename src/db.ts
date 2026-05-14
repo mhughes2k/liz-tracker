@@ -171,6 +171,72 @@ export interface Dependency {
   created_at: string;
 }
 
+// TRACK-280: Typed links between items (generic, not dispatch-affecting)
+export const VALID_LINK_RELATIONS = [
+  "relates_to",
+  "duplicates",
+  "duplicated_by",
+  "supersedes",
+  "superseded_by",
+  "parent_of",
+  "child_of",
+  "mentions",
+  "mentioned_by",
+] as const;
+export type LinkRelation = (typeof VALID_LINK_RELATIONS)[number];
+
+export const VALID_LINK_SOURCES = [
+  "manual",
+  "mention",
+  "merge",
+  "embedding",
+  "batch",
+] as const;
+export type LinkSource = (typeof VALID_LINK_SOURCES)[number];
+
+/** Relations that are stored as a single row but represent both directions. */
+const SYMMETRIC_RELATIONS: Set<LinkRelation> = new Set(["relates_to"]);
+
+/** Map a directional relation to its inverse, for symmetric-row expansion in reads. */
+const INVERSE_RELATION: Record<LinkRelation, LinkRelation> = {
+  relates_to: "relates_to",
+  duplicates: "duplicated_by",
+  duplicated_by: "duplicates",
+  supersedes: "superseded_by",
+  superseded_by: "supersedes",
+  parent_of: "child_of",
+  child_of: "parent_of",
+  mentions: "mentioned_by",
+  mentioned_by: "mentions",
+};
+
+export interface Link {
+  id: string;
+  from_item_id: string;
+  to_item_id: string;
+  relation: LinkRelation;
+  symmetric: number; // 0 or 1
+  source: LinkSource;
+  confidence: number | null;
+  note: string | null;
+  created_by: string;
+  created_at: string;
+}
+
+/**
+ * Expanded link with the perspective of one item.
+ * If the underlying row stores the inverse direction (or is symmetric), this
+ * normalizes the shape so callers see the relation from the queried item's POV.
+ */
+export interface ExpandedLink extends Link {
+  /** Effective relation from the queried item's perspective. */
+  perspective_relation: LinkRelation;
+  /** The other item's ID (the one being linked to/from). */
+  other_item_id: string;
+  /** True if this row was the inverse direction (or symmetric mirror). */
+  is_inverse: boolean;
+}
+
 export interface Attachment {
   id: string;
   work_item_id: string;
@@ -349,6 +415,27 @@ function createSchema(database: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_activity_log_item ON tracker_activity_log(item_id);
     CREATE INDEX IF NOT EXISTS idx_activity_log_action ON tracker_activity_log(action);
     CREATE INDEX IF NOT EXISTS idx_activity_log_created ON tracker_activity_log(created_at);
+
+    -- TRACK-280: Typed item-to-item links (generic edge table, separate from
+    -- tracker_dependencies which carries dispatch/orchestrator semantics).
+    CREATE TABLE IF NOT EXISTS tracker_links (
+      id TEXT PRIMARY KEY,
+      from_item_id TEXT NOT NULL,
+      to_item_id TEXT NOT NULL,
+      relation TEXT NOT NULL,
+      symmetric INTEGER NOT NULL DEFAULT 0,
+      source TEXT NOT NULL DEFAULT 'manual',
+      confidence REAL,
+      note TEXT,
+      created_by TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (from_item_id) REFERENCES tracker_work_items(id) ON DELETE CASCADE,
+      FOREIGN KEY (to_item_id) REFERENCES tracker_work_items(id) ON DELETE CASCADE,
+      UNIQUE(from_item_id, to_item_id, relation)
+    );
+    CREATE INDEX IF NOT EXISTS idx_links_from ON tracker_links(from_item_id);
+    CREATE INDEX IF NOT EXISTS idx_links_to ON tracker_links(to_item_id);
+    CREATE INDEX IF NOT EXISTS idx_links_relation ON tracker_links(relation);
   `);
 }
 
@@ -1415,6 +1502,16 @@ export function createWorkItem(data: {
     timestamp: ts,
   });
 
+  // TRACK-280: auto-extract mention links from title + description
+  // Why: keeps the relationship graph in sync without manual upkeep.
+  // Safety: only resolves to existing item keys; self-links and unresolved
+  //         keys are silently skipped, so this can't corrupt the item.
+  try {
+    reconcileMentionLinks(item.id, item.created_by);
+  } catch (e) {
+    logger.warn({ err: e, itemId: item.id }, "Mention reconciliation failed");
+  }
+
   return item;
 }
 
@@ -1704,6 +1801,15 @@ export function updateWorkItem(
     data: { ...data },
     timestamp: updated.updated_at,
   });
+
+  // TRACK-280: re-reconcile mention links when title or description changes.
+  if (data.title !== undefined || data.description !== undefined) {
+    try {
+      reconcileMentionLinks(id, data.actor || "system");
+    } catch (e) {
+      logger.warn({ err: e, itemId: id }, "Mention reconciliation failed");
+    }
+  }
 
   return updated;
 }
@@ -2008,6 +2114,9 @@ export function deleteWorkItem(id: string): boolean {
 
   db.prepare(
     "DELETE FROM tracker_dependencies WHERE work_item_id = ? OR depends_on_id = ?",
+  ).run(id, id);
+  db.prepare(
+    "DELETE FROM tracker_links WHERE from_item_id = ? OR to_item_id = ?",
   ).run(id, id);
   db.prepare("DELETE FROM tracker_watchers WHERE work_item_id = ?").run(id);
   db.prepare("DELETE FROM tracker_transitions WHERE work_item_id = ?").run(id);
@@ -2697,6 +2806,359 @@ export function getBlockers(workItemId: string): WorkItem[] {
        ORDER BY wi.priority DESC, wi.created_at`,
     )
     .all(workItemId) as WorkItem[];
+}
+
+// ── Links (TRACK-280) ──
+
+/**
+ * Add a typed link from one item to another.
+ *
+ * Idempotent: re-adding an existing link updates the optional note and returns
+ * the existing row. Symmetric relations (e.g. relates_to) are stored as a
+ * single row with symmetric=1 — readers expand the inverse virtually.
+ *
+ * Throws on:
+ *  - unknown relation
+ *  - self-link
+ *  - missing source/target item
+ */
+export function addLink(args: {
+  from_item_id: string;
+  to_item_id: string;
+  relation: LinkRelation | string;
+  source?: LinkSource;
+  confidence?: number | null;
+  note?: string | null;
+  created_by: string;
+}): Link {
+  if (!VALID_LINK_RELATIONS.includes(args.relation as LinkRelation)) {
+    throw new Error(
+      `Invalid relation '${args.relation}'. Valid: ${VALID_LINK_RELATIONS.join(", ")}`,
+    );
+  }
+  if (args.from_item_id === args.to_item_id) {
+    throw new Error("An item cannot link to itself");
+  }
+  const relation = args.relation as LinkRelation;
+
+  const fromItem = getWorkItem(args.from_item_id);
+  if (!fromItem) throw new Error("from_item_id not found");
+  const toItem = getWorkItem(args.to_item_id);
+  if (!toItem) throw new Error("to_item_id not found");
+
+  const symmetric = SYMMETRIC_RELATIONS.has(relation) ? 1 : 0;
+
+  // For symmetric relations, an existing row in the inverse direction also
+  // counts as the same logical link — short-circuit and return it.
+  if (symmetric) {
+    const mirror = db
+      .prepare(
+        "SELECT * FROM tracker_links WHERE from_item_id = ? AND to_item_id = ? AND relation = ?",
+      )
+      .get(args.to_item_id, args.from_item_id, relation) as Link | undefined;
+    if (mirror) {
+      if (args.note !== undefined && args.note !== mirror.note) {
+        db.prepare("UPDATE tracker_links SET note = ? WHERE id = ?").run(
+          args.note,
+          mirror.id,
+        );
+        return { ...mirror, note: args.note };
+      }
+      return mirror;
+    }
+  }
+
+  // Idempotency on (from, to, relation)
+  const existing = db
+    .prepare(
+      "SELECT * FROM tracker_links WHERE from_item_id = ? AND to_item_id = ? AND relation = ?",
+    )
+    .get(args.from_item_id, args.to_item_id, relation) as Link | undefined;
+  if (existing) {
+    if (args.note !== undefined && args.note !== existing.note) {
+      db.prepare("UPDATE tracker_links SET note = ? WHERE id = ?").run(
+        args.note,
+        existing.id,
+      );
+      return { ...existing, note: args.note };
+    }
+    return existing;
+  }
+
+  const link: Link = {
+    id: genId(),
+    from_item_id: args.from_item_id,
+    to_item_id: args.to_item_id,
+    relation,
+    symmetric,
+    source: args.source || "manual",
+    confidence: args.confidence ?? null,
+    note: args.note ?? null,
+    created_by: args.created_by,
+    created_at: now(),
+  };
+  db.prepare(
+    `INSERT INTO tracker_links (id, from_item_id, to_item_id, relation, symmetric, source, confidence, note, created_by, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    link.id,
+    link.from_item_id,
+    link.to_item_id,
+    link.relation,
+    link.symmetric,
+    link.source,
+    link.confidence,
+    link.note,
+    link.created_by,
+    link.created_at,
+  );
+
+  const fromKey = getWorkItemKey(fromItem);
+  const toKey = getWorkItemKey(toItem);
+  logActivity({
+    project_id: fromItem.project_id,
+    item_id: fromItem.id,
+    action: "link.added",
+    actor: link.created_by,
+    summary: `Linked ${fromKey} → ${toKey} (${relation})`,
+    details: {
+      link_id: link.id,
+      to_item_id: link.to_item_id,
+      to_item_key: toKey,
+      relation,
+      source: link.source,
+    },
+  });
+
+  return link;
+}
+
+/**
+ * Remove a link by (from, to, relation). For symmetric relations, also removes
+ * the inverse row if it exists.
+ *
+ * Returns true if at least one row was deleted.
+ */
+export function removeLink(args: {
+  from_item_id: string;
+  to_item_id: string;
+  relation: LinkRelation | string;
+  actor?: string;
+}): boolean {
+  const relation = args.relation as LinkRelation;
+  if (!VALID_LINK_RELATIONS.includes(relation)) {
+    return false;
+  }
+
+  // Snapshot for the activity log before deleting.
+  const symmetric = SYMMETRIC_RELATIONS.has(relation);
+  const rows = db
+    .prepare(
+      symmetric
+        ? `SELECT * FROM tracker_links
+           WHERE relation = ?
+             AND ((from_item_id = ? AND to_item_id = ?)
+               OR (from_item_id = ? AND to_item_id = ?))`
+        : `SELECT * FROM tracker_links
+           WHERE from_item_id = ? AND to_item_id = ? AND relation = ?`,
+    )
+    .all(
+      ...(symmetric
+        ? [relation, args.from_item_id, args.to_item_id, args.to_item_id, args.from_item_id]
+        : [args.from_item_id, args.to_item_id, relation]),
+    ) as Link[];
+
+  if (rows.length === 0) return false;
+
+  const result = db
+    .prepare(
+      symmetric
+        ? `DELETE FROM tracker_links
+           WHERE relation = ?
+             AND ((from_item_id = ? AND to_item_id = ?)
+               OR (from_item_id = ? AND to_item_id = ?))`
+        : `DELETE FROM tracker_links
+           WHERE from_item_id = ? AND to_item_id = ? AND relation = ?`,
+    )
+    .run(
+      ...(symmetric
+        ? [relation, args.from_item_id, args.to_item_id, args.to_item_id, args.from_item_id]
+        : [args.from_item_id, args.to_item_id, relation]),
+    );
+
+  if (result.changes > 0) {
+    const fromItem = getWorkItem(args.from_item_id);
+    const toItem = getWorkItem(args.to_item_id);
+    const fromKey = fromItem ? getWorkItemKey(fromItem) : args.from_item_id;
+    const toKey = toItem ? getWorkItemKey(toItem) : args.to_item_id;
+    logActivity({
+      project_id: fromItem?.project_id || null,
+      item_id: fromItem?.id || null,
+      action: "link.removed",
+      actor: args.actor || "system",
+      summary: `Removed link ${fromKey} → ${toKey} (${relation})`,
+      details: { to_item_id: args.to_item_id, relation },
+    });
+  }
+  return result.changes > 0;
+}
+
+/**
+ * Remove a link by its row id (helper for the DELETE-by-link-id REST endpoint).
+ */
+export function removeLinkById(linkId: string, actor?: string): boolean {
+  const row = db
+    .prepare("SELECT * FROM tracker_links WHERE id = ?")
+    .get(linkId) as Link | undefined;
+  if (!row) return false;
+  return removeLink({
+    from_item_id: row.from_item_id,
+    to_item_id: row.to_item_id,
+    relation: row.relation,
+    actor,
+  });
+}
+
+/**
+ * List all links involving an item — both directions, with symmetric relations
+ * expanded so callers see a normalized "from the item's perspective" shape.
+ *
+ * Optional filter by relation matches the perspective_relation (inverses are
+ * resolved before filtering).
+ */
+export function listLinks(
+  workItemId: string,
+  relationFilter?: LinkRelation | string,
+): ExpandedLink[] {
+  const rows = db
+    .prepare(
+      `SELECT * FROM tracker_links
+       WHERE from_item_id = ? OR to_item_id = ?
+       ORDER BY created_at DESC`,
+    )
+    .all(workItemId, workItemId) as Link[];
+
+  const expanded: ExpandedLink[] = [];
+  for (const row of rows) {
+    const relation = row.relation as LinkRelation;
+    if (row.from_item_id === workItemId) {
+      expanded.push({
+        ...row,
+        perspective_relation: relation,
+        other_item_id: row.to_item_id,
+        is_inverse: false,
+      });
+    }
+    if (row.to_item_id === workItemId) {
+      // Symmetric stored as a single row — only emit the inverse view; the
+      // forward view was already covered if from_item_id === workItemId (which
+      // would only happen for self-links, which we forbid).
+      expanded.push({
+        ...row,
+        perspective_relation: row.symmetric === 1 ? relation : INVERSE_RELATION[relation],
+        other_item_id: row.from_item_id,
+        is_inverse: row.symmetric !== 1,
+      });
+    }
+  }
+
+  if (relationFilter) {
+    return expanded.filter((l) => l.perspective_relation === relationFilter);
+  }
+  return expanded;
+}
+
+/**
+ * Convenience wrapper around listLinks with a mandatory relation filter.
+ */
+export function listLinksByRelation(
+  workItemId: string,
+  relation: LinkRelation,
+): ExpandedLink[] {
+  return listLinks(workItemId, relation);
+}
+
+/**
+ * Extract `[A-Z]+-[0-9]+` tokens from a body of text. Returns the unique set.
+ * Single-letter prefixes are excluded (false positives from things like "A-1").
+ */
+export function extractMentionKeys(text: string): string[] {
+  if (!text) return [];
+  const found = new Set<string>();
+  const re = /\b([A-Z]{2,})-(\d+)\b/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    found.add(`${match[1]}-${match[2]}`);
+  }
+  return Array.from(found);
+}
+
+/**
+ * Reconcile auto-extracted `mentions` links for an item against the current
+ * body text (title + description). Adds links for newly mentioned items and
+ * removes stale ones that no longer appear.
+ *
+ * Skips self-mentions and unresolved keys silently — they're not errors, the
+ * body text may reference items that don't exist or include the item's own key.
+ *
+ * Called synchronously from createWorkItem and updateWorkItem when description
+ * or title changes.
+ */
+export function reconcileMentionLinks(workItemId: string, actor: string): void {
+  const item = getWorkItem(workItemId);
+  if (!item) return;
+  const itemKey = getWorkItemKey(item);
+
+  const body = `${item.title || ""}\n${item.description || ""}`;
+  const tokens = extractMentionKeys(body);
+
+  // Resolve to existing item IDs, excluding self.
+  const desired = new Set<string>();
+  for (const key of tokens) {
+    if (key === itemKey) continue;
+    const target = getWorkItemByKey(key);
+    if (target && target.id !== workItemId) {
+      desired.add(target.id);
+    }
+  }
+
+  // Current auto-mention links from this item.
+  const existing = db
+    .prepare(
+      `SELECT * FROM tracker_links
+       WHERE from_item_id = ? AND relation = 'mentions' AND source = 'mention'`,
+    )
+    .all(workItemId) as Link[];
+  const existingIds = new Set(existing.map((l) => l.to_item_id));
+
+  // Add missing.
+  for (const toId of desired) {
+    if (!existingIds.has(toId)) {
+      try {
+        addLink({
+          from_item_id: workItemId,
+          to_item_id: toId,
+          relation: "mentions",
+          source: "mention",
+          created_by: actor,
+        });
+      } catch {
+        // Best-effort: a race or invalid id shouldn't break the item update.
+      }
+    }
+  }
+
+  // Remove stale (only auto-mention links — never touch manual links).
+  for (const link of existing) {
+    if (!desired.has(link.to_item_id)) {
+      removeLink({
+        from_item_id: link.from_item_id,
+        to_item_id: link.to_item_id,
+        relation: "mentions",
+        actor,
+      });
+    }
+  }
 }
 
 // ── Stats ──

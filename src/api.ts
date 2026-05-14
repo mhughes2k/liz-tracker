@@ -61,6 +61,12 @@ import {
   getDependents,
   getBlockers,
   isBlocked,
+  addLink,
+  removeLink,
+  removeLinkById,
+  listLinks,
+  VALID_LINK_RELATIONS,
+  type LinkRelation,
   createComment,
   listComments,
   getCommentCounts,
@@ -1103,6 +1109,75 @@ Extract the structured fields from this description. Return ONLY valid JSON.`;
       ) {
         const ok = removeDependency(itemId, decodeURIComponent(parts[3]));
         if (!ok) return error(res, "Dependency not found", 404);
+        return json(res, { deleted: true });
+      }
+
+      // TRACK-280: GET/POST /items/:id/links
+      if (parts.length === 3 && parts[2] === "links") {
+        if (method === "GET") {
+          const qs = queryParams(req.url || "");
+          const relation = qs.get("relation") || undefined;
+          if (relation && !VALID_LINK_RELATIONS.includes(relation as LinkRelation)) {
+            return error(res, `Invalid relation. Valid: ${VALID_LINK_RELATIONS.join(", ")}`);
+          }
+          const links = listLinks(itemId, relation as LinkRelation | undefined);
+          // Hydrate with the other item's key, title, state, project_id, etc.
+          const hydrated = links.map((l) => {
+            const other = getWorkItem(l.other_item_id);
+            return {
+              ...l,
+              other_item_key: other ? getWorkItemKey(other) : null,
+              other_item_title: other?.title || null,
+              other_item_state: other?.state || null,
+              other_item_priority: other?.priority || null,
+              other_item_project_id: other?.project_id || null,
+              other_item_space_type: other?.space_type || null,
+            };
+          });
+          return json(res, hydrated);
+        }
+        if (method === "POST") {
+          const body = await parseBody(req);
+          if (!body.to_item_id) return error(res, "to_item_id is required");
+          if (!body.relation) return error(res, "relation is required");
+          if (!VALID_LINK_RELATIONS.includes(body.relation as LinkRelation)) {
+            return error(res, `Invalid relation. Valid: ${VALID_LINK_RELATIONS.join(", ")}`);
+          }
+          // Allow display keys (e.g. "TRACK-5") as well as raw IDs in to_item_id.
+          let toId = String(body.to_item_id);
+          const byKey = getWorkItemByKey(toId);
+          if (byKey) toId = byKey.id;
+          const actor = body.actor ? String(body.actor) : "dashboard";
+          try {
+            const link = addLink({
+              from_item_id: itemId,
+              to_item_id: toId,
+              relation: body.relation as LinkRelation,
+              note: body.note ? String(body.note) : undefined,
+              source: "manual",
+              created_by: actor,
+            });
+            return json(res, link, 201);
+          } catch (e) {
+            return error(
+              res,
+              e instanceof Error ? e.message : "Failed to add link",
+            );
+          }
+        }
+      }
+
+      // TRACK-280: DELETE /items/:id/links/:linkId
+      if (
+        parts.length === 4 &&
+        parts[2] === "links" &&
+        method === "DELETE"
+      ) {
+        const linkId = decodeURIComponent(parts[3]);
+        const qs = queryParams(req.url || "");
+        const actor = qs.get("actor") || "dashboard";
+        const ok = removeLinkById(linkId, actor);
+        if (!ok) return error(res, "Link not found", 404);
         return json(res, { deleted: true });
       }
 
