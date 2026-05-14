@@ -11127,55 +11127,278 @@
           return () => { es.close(); _sessionViewerSources.delete(item.id); };
         }
 
-        /** Append a single event to the session viewer activity feed. */
+        /**
+         * Render a friendlier tool name. Strips the `mcp__server__` namespace prefix
+         * (e.g. `mcp__tracker__tracker_lock_item` → `tracker_lock_item`) so the
+         * activity feed isn't dominated by routing noise.
+         */
+        function _displayToolName(tool) {
+          if (!tool) return '';
+          if (tool.startsWith('mcp__')) {
+            const parts = tool.split('__');
+            return parts[parts.length - 1] || tool;
+          }
+          return tool;
+        }
+
+        /**
+         * Build a one-line summary of a tool invocation from its `args` JSON.
+         * Each tool gets a hand-picked field (Bash → command, Grep → pattern, etc.)
+         * so that activity-feed rows show *what* is happening, not just *which* tool.
+         * Returns "" when nothing useful can be extracted.
+         */
+        function _summarizeToolCall(event) {
+          let a = {};
+          if (event && event.args) {
+            try { a = JSON.parse(event.args); } catch { a = {}; }
+          }
+          const tool = event && event.tool ? event.tool : '';
+          const file = event && event.file ? event.file : '';
+
+          // MCP tracker tools — show key identifier args
+          if (tool.startsWith('mcp__tracker__')) {
+            const parts = [];
+            if (a.item_id) parts.push(a.item_id);
+            else if (a.id) parts.push(a.id);
+            else if (a.project_id) parts.push('project=' + a.project_id);
+            if (a.state) parts.push('→ ' + a.state);
+            if (a.body) parts.push(_oneLine(a.body, 60));
+            return parts.join(' ');
+          }
+          // Other MCP tools — pick the first meaningful string field
+          if (tool.startsWith('mcp__')) {
+            for (const k of ['query', 'url', 'path', 'pattern', 'id', 'name']) {
+              if (typeof a[k] === 'string' && a[k]) return a[k];
+            }
+            return '';
+          }
+
+          switch (tool) {
+            case 'Bash':
+              return a.command ? _oneLine(a.command, 200) : '';
+            case 'Edit':
+            case 'Write':
+            case 'NotebookEdit':
+              return a.file_path || file;
+            case 'MultiEdit': {
+              const path = a.file_path || file;
+              const n = Array.isArray(a.edits) ? a.edits.length : 0;
+              return n ? path + ' (' + n + ' edits)' : path;
+            }
+            case 'Read': {
+              const path = a.file_path || file;
+              if (a.offset || a.limit) {
+                const start = a.offset || 1;
+                const end = a.limit ? start + a.limit - 1 : '';
+                return path + ' [' + start + (end ? '–' + end : '+') + ']';
+              }
+              return path;
+            }
+            case 'Grep': {
+              const pat = a.pattern ? '/' + a.pattern + '/' : '';
+              const where = a.path ? ' in ' + a.path : (a.glob ? ' ' + a.glob : (a.type ? ' (' + a.type + ')' : ''));
+              return pat + where;
+            }
+            case 'Glob':
+              return a.pattern ? a.pattern + (a.path ? ' in ' + a.path : '') : '';
+            case 'WebFetch':
+              return a.url || '';
+            case 'WebSearch':
+              return a.query || '';
+            case 'ToolSearch':
+              return a.query || '';
+            case 'Task':
+            case 'Agent':
+              return a.description || (typeof a.prompt === 'string' ? _oneLine(a.prompt, 80) : '');
+            case 'Skill':
+              return a.skill || '';
+            case 'TodoWrite': {
+              if (!Array.isArray(a.todos)) return '';
+              const inProg = a.todos.find(t => t && t.status === 'in_progress');
+              const summary = a.todos.length + (a.todos.length === 1 ? ' task' : ' tasks');
+              return inProg && inProg.activeForm ? summary + ' — ' + inProg.activeForm : summary;
+            }
+            case 'ScheduleWakeup':
+              return a.reason || (a.delaySeconds ? a.delaySeconds + 's' : '');
+            case 'KillShell':
+              return a.shell_id || '';
+            case 'BashOutput':
+              return a.bash_id || '';
+          }
+          return file;
+        }
+
+        /** Collapse whitespace and truncate to `max` chars (adds ellipsis). */
+        function _oneLine(s, max) {
+          if (!s) return '';
+          const flat = String(s).replace(/\s+/g, ' ').trim();
+          return flat.length > max ? flat.slice(0, max - 1) + '\u2026' : flat;
+        }
+
+        /**
+         * Append a single event to the session viewer activity feed.
+         *
+         * Uses two per-container Maps (stored as element properties) to correlate events:
+         *   - `_callMap`: tool_use call_id → row element, so the matching tool_result
+         *     can update the spinner to a check/cross in place rather than emitting
+         *     a second row.
+         *   - `_textMap`: partial_text message_id → row element, so streamed token
+         *     deltas accumulate into a single live-updating block; the final `text`
+         *     event then replaces the partial content with the canonical full text.
+         */
         function _appendSessionEvent(container, event) {
-          const div = document.createElement('div');
-          div.style.padding = '2px 0';
-          div.style.borderBottom = '1px solid var(--border-light)';
+          if (!container._callMap) container._callMap = new Map();
+          if (!container._textMap) container._textMap = new Map();
 
           switch (event.event) {
-            case 'started':
-              div.style.color = 'var(--text-muted)';
-              div.textContent = '\ud83e\udd16 Session started (' + event.sessionId + ')';
+            case 'started': {
+              const div = document.createElement('div');
+              div.style.cssText = 'padding:2px 0; color:var(--text-muted);';
+              div.textContent = '\ud83e\udd16 Session started (' + (event.sessionId || '') + ')';
+              container.appendChild(div);
               break;
-            case 'tool_use':
-              div.style.color = 'var(--text)';
-              div.textContent = '\ud83d\udd27 ' + event.tool + (event.file ? ' ' + event.file : '');
+            }
+            case 'tool_use': {
+              const div = document.createElement('div');
+              div.style.cssText = 'padding:2px 0; border-bottom:1px solid var(--border-light); display:flex; align-items:baseline; gap:6px;';
+              const status = document.createElement('span');
+              status.className = 'sv-tool-status';
+              status.style.cssText = 'flex:0 0 14px; color:var(--text-muted);';
+              status.textContent = '\u21bb';
+              const name = document.createElement('span');
+              name.style.cssText = 'font-weight:500; flex-shrink:0;';
+              name.textContent = _displayToolName(event.tool);
+              const summary = _summarizeToolCall(event);
+              const sum = document.createElement('span');
+              sum.style.cssText = 'color:var(--text-muted); flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
+              sum.textContent = summary;
+              if (summary) sum.title = summary;
+              div.appendChild(status);
+              div.appendChild(name);
+              if (summary) div.appendChild(sum);
+              container.appendChild(div);
+              if (event.call_id) container._callMap.set(event.call_id, div);
               break;
-            case 'tool_result':
-              div.style.color = event.status === 'error' ? 'var(--highlight)' : 'var(--text)';
-              div.textContent = '  ' + (event.status === 'error' ? '\u2717' : '\u2713') + ' ' + event.tool + (event.error ? ': ' + event.error : '');
+            }
+            case 'tool_result': {
+              const useEl = event.call_id ? container._callMap.get(event.call_id) : null;
+              const ok = event.status !== 'error';
+              const icon = ok ? '\u2713' : '\u2717';
+              const color = ok ? '#28a745' : 'var(--highlight)';
+              if (useEl) {
+                const statusEl = useEl.querySelector('.sv-tool-status');
+                if (statusEl) { statusEl.textContent = icon; statusEl.style.color = color; }
+                if (!ok && event.error) {
+                  const errEl = document.createElement('div');
+                  errEl.style.cssText = 'padding:2px 0 2px 22px; color:var(--highlight); font-size:11px; white-space:pre-wrap;';
+                  errEl.textContent = event.error;
+                  useEl.parentNode && useEl.parentNode.insertBefore(errEl, useEl.nextSibling);
+                }
+                if (event.call_id) container._callMap.delete(event.call_id);
+              } else {
+                const div = document.createElement('div');
+                div.style.cssText = 'padding:2px 0; color:' + color + ';';
+                div.textContent = '  ' + icon + ' ' + _displayToolName(event.tool) + (event.error ? ': ' + event.error : '');
+                container.appendChild(div);
+              }
               break;
-            case 'text':
-              div.style.color = 'var(--text)';
+            }
+            case 'edit': {
+              const div = document.createElement('div');
+              div.style.cssText = 'padding:2px 0; border-bottom:1px solid var(--border-light); display:flex; align-items:baseline; gap:6px;';
+              const icon = document.createElement('span');
+              icon.style.cssText = 'flex:0 0 14px; color:var(--text-muted);';
+              icon.textContent = event.change_type === 'write' ? '\u002b' : event.change_type === 'multi_edit' ? '\u2261' : '\u270e';
+              const path = document.createElement('span');
+              path.style.cssText = 'flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
+              path.textContent = event.path || '';
+              path.title = event.path || '';
+              let added = 0, removed = 0;
+              if (event.diff) {
+                for (const line of event.diff.split('\n')) {
+                  if (line.startsWith('+') && !line.startsWith('+++')) added++;
+                  else if (line.startsWith('-') && !line.startsWith('---')) removed++;
+                }
+              }
+              const stats = document.createElement('span');
+              stats.style.cssText = 'flex-shrink:0; font-size:11px;';
+              if (added || removed) {
+                stats.innerHTML = '<span style="color:#28a745;">+' + added + '</span> '
+                  + '<span style="color:var(--highlight);">\u2212' + removed + '</span>';
+              }
+              div.appendChild(icon);
+              div.appendChild(path);
+              if (added || removed) div.appendChild(stats);
+              container.appendChild(div);
+              break;
+            }
+            case 'partial_text': {
+              const mid = event.message_id || '_default';
+              let div = container._textMap.get(mid);
+              if (!div) {
+                div = document.createElement('div');
+                div.style.cssText = 'padding:4px 0; color:var(--text); white-space:pre-wrap;';
+                container.appendChild(div);
+                container._textMap.set(mid, div);
+              }
+              div.textContent += (event.delta || '');
+              break;
+            }
+            case 'text': {
               const text = event.content || '';
-              div.textContent = text.length > 500 ? text.slice(0, 500) + '\u2026' : text;
+              const display = text.length > 2000 ? text.slice(0, 2000) + '\u2026' : text;
+              // Promote any in-progress partial-text block whose accumulated content
+              // matches the final text (avoids duplicate rendering during live SSE).
+              for (const [mid, partial] of container._textMap) {
+                if (partial.textContent === text || partial.textContent === display || text.startsWith(partial.textContent)) {
+                  partial.textContent = display;
+                  container._textMap.delete(mid);
+                  return;
+                }
+              }
+              const div = document.createElement('div');
+              div.style.cssText = 'padding:4px 0; color:var(--text); white-space:pre-wrap;';
+              div.textContent = display;
+              container.appendChild(div);
               break;
-            case 'error':
-              div.style.color = 'var(--highlight)';
-              div.style.fontWeight = '600';
+            }
+            case 'error': {
+              const div = document.createElement('div');
+              div.style.cssText = 'padding:2px 0; color:var(--highlight); font-weight:600;';
               div.textContent = '\u2717 Error: ' + event.message;
+              container.appendChild(div);
               break;
-            case 'completed':
-              div.style.color = '#28a745';
-              div.style.fontWeight = '600';
+            }
+            case 'completed': {
+              const div = document.createElement('div');
+              div.style.cssText = 'padding:2px 0; color:#28a745; font-weight:600;';
               div.textContent = '\u2713 Completed (' + event.duration + 's, ' + event.turns + ' turns' + (event.cost ? ', $' + event.cost.toFixed(3) : '') + ')';
+              container.appendChild(div);
               break;
-            case 'heartbeat':
+            }
+            case 'heartbeat': {
               if (event.elapsed % 120 !== 0 && event.elapsed > 0) return;
-              div.style.color = 'var(--text-dim)';
-              div.style.fontSize = '11px';
+              const div = document.createElement('div');
+              div.style.cssText = 'padding:2px 0; color:var(--text-dim); font-size:11px;';
               div.textContent = '\u2026 ' + event.elapsed + 's elapsed, ' + event.turns + ' turns';
+              container.appendChild(div);
               break;
-            case 'status':
-              div.style.color = 'var(--text-muted)';
-              div.style.fontStyle = 'italic';
+            }
+            case 'status': {
+              // Deduplicate consecutive identical statuses — the SDK repeats "requesting"
+              // many times during a single LLM call, which floods the feed otherwise.
+              const last = container.lastElementChild;
+              if (last && last.dataset && last.dataset.statusKey === event.status) return;
+              const div = document.createElement('div');
+              div.dataset.statusKey = event.status || '';
+              div.style.cssText = 'padding:2px 0; color:var(--text-muted); font-style:italic;';
               div.textContent = '\u21bb ' + event.status;
+              container.appendChild(div);
               break;
+            }
             default:
               return;
           }
-          container.appendChild(div);
         }
 
         /** Extract text content from transcript events for summarization. */
