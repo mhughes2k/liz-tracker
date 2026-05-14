@@ -3077,10 +3077,17 @@ export interface AttentionProject {
   items: (WorkItem & { key: string })[];
 }
 
+/** Window for including recently-completed items in the attention view. */
+const RECENT_DONE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 /**
  * Get all items across all projects that need the owner's attention.
  * States: needs_input, in_review, testing, brainstorming.
- * Grouped by project, sorted by priority within each group.
+ * Also includes items completed (state=done) in the last 24 hours so consumers
+ * have passive awareness of what just landed — they're tagged with {done} like
+ * any other state, so consumers can distinguish.
+ * Grouped by project, sorted by priority within each group; recently-done
+ * items appended at the end of each group, newest first.
  */
 export function getAttentionItems(): AttentionProject[] {
   const placeholders = ATTENTION_STATES.map(() => "?").join(", ");
@@ -3094,9 +3101,18 @@ export function getAttentionItems(): AttentionProject[] {
     )
     .all(...ATTENTION_STATES) as WorkItem[];
 
+  const since = new Date(Date.now() - RECENT_DONE_WINDOW_MS).toISOString();
+  const recentDone = db
+    .prepare(
+      `SELECT * FROM tracker_work_items
+       WHERE state = 'done' AND updated_at >= ?
+       ORDER BY updated_at DESC`,
+    )
+    .all(since) as WorkItem[];
+
   // Group by project
   const projectMap = new Map<string, (WorkItem & { key: string })[]>();
-  for (const item of items) {
+  const addToMap = (item: WorkItem) => {
     if (!projectMap.has(item.project_id)) {
       projectMap.set(item.project_id, []);
     }
@@ -3106,7 +3122,9 @@ export function getAttentionItems(): AttentionProject[] {
       ...item,
       key: `${prefix}-${item.seq_number}`,
     });
-  }
+  };
+  for (const item of items) addToMap(item);
+  for (const item of recentDone) addToMap(item);
 
   // Build result with project info
   const result: AttentionProject[] = [];
