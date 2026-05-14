@@ -262,6 +262,8 @@ When `DISPATCH_MODE=runner`:
   - `error` — runner error with `message`, `recoverable`
 - Truncation constants live in `src/runner-output.ts` (`MAX_OUTPUT_BYTES=64KB`, `MAX_ARGS_BYTES=8KB`)
 
+**Dashboard rendering (Phase 2 of TRACK-275):** The runner-mode session viewer in `src/ui/core.html` consumes every event through a part registry (`SESSION_PART_RENDERERS`) — one renderer per event kind. Tool-use and edit rows are expandable cards: clicking shows pretty-printed args, the tool's full output (≤64KB, syntax-highlighted via highlight.js loaded lazily on first expand), and unified diffs (rendered via diff2html, also lazy-loaded). Diffs over 500 lines are gated behind a confirmation button to avoid main-thread stalls. Bash output gets a terminal-styled header with a Copy-command button. Assistant text renders as markdown via the shared `renderMarkdown()` helper. Multi-line steering composer auto-grows up to 8 lines; smart auto-scroll only sticks to the bottom when the user is already there (otherwise a `↓ N new` pill appears). The same renderer runs for both the live SSE feed and the audit-log transcript replay.
+
 ### Security (auto-execution hardening)
 
 Prevents prompt injection attacks from causing the orchestrator to auto-execute malicious tasks. Only human-approved items with verified descriptions get dispatched.
