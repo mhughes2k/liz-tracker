@@ -521,6 +521,7 @@ async function runClusteringJob(
 export function isEmbeddingsEnabled(): boolean {
   if (EMBEDDING_PROVIDER === "voyage") return !!VOYAGE_API_KEY;
   if (
+    EMBEDDING_PROVIDER === "omlx" ||
     EMBEDDING_PROVIDER === "local" ||
     EMBEDDING_PROVIDER === "mock" ||
     EMBEDDING_PROVIDER === "anthropic"

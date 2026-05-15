@@ -404,7 +404,13 @@ export const DECKWRIGHT_URL = (
 
 /**
  * Embedding provider for the similarity / merge-candidates / topic / drift pipeline.
- * - "voyage"  → calls Voyage AI (https://api.voyageai.com). Requires VOYAGE_API_KEY.
+ * - "omlx"    → calls a local OpenAI-compatible oMLX server (default: the same
+ *   Qwen3-Embedding-8B-4bit-DWQ deployment LIZ uses for its memory system).
+ *   Private data stays on the LAN. This is the default — Martin's constraint is
+ *   that tracker content must never leave the local network.
+ * - "voyage"  → calls Voyage AI cloud (https://api.voyageai.com). Requires
+ *   VOYAGE_API_KEY. **Do not enable for private data** — text is sent to a
+ *   third-party hosted service. Kept as an opt-in fallback only.
  * - "anthropic" → reserved (Anthropic does not currently ship a public embeddings
  *   endpoint; selecting this falls back to a deterministic mock until an API exists,
  *   so the rest of the pipeline can run end-to-end in CI without network calls).
@@ -412,13 +418,17 @@ export const DECKWRIGHT_URL = (
  *   tests, offline development, and graceful degradation when no key is configured.
  * - "mock"    → alias for "local" (kept so older `.env` files keep working).
  *
- * Default is "local" (rather than "voyage") so a fresh install never requires
- * external credentials to boot. Operators opt in to Voyage by setting both
- * EMBEDDING_PROVIDER=voyage and VOYAGE_API_KEY.
+ * Tests explicitly pass `provider: "local"` (or set EMBEDDING_PROVIDER=local in
+ * the test harness) so the omlx default never causes network calls in CI.
  */
-export type EmbeddingProvider = "voyage" | "anthropic" | "local" | "mock";
+export type EmbeddingProvider =
+  | "omlx"
+  | "voyage"
+  | "anthropic"
+  | "local"
+  | "mock";
 export const EMBEDDING_PROVIDER: EmbeddingProvider = (
-  (process.env.EMBEDDING_PROVIDER as EmbeddingProvider) || "local"
+  (process.env.EMBEDDING_PROVIDER as EmbeddingProvider) || "omlx"
 );
 
 /** Voyage API key — required when EMBEDDING_PROVIDER=voyage. */
@@ -430,6 +440,40 @@ export const VOYAGE_MODEL = process.env.VOYAGE_MODEL || "voyage-3";
 /** Voyage embedding endpoint (overridable for tests / proxies). */
 export const VOYAGE_API_URL =
   process.env.VOYAGE_API_URL || "https://api.voyageai.com/v1/embeddings";
+
+/**
+ * oMLX (local OpenAI-compatible) embedding server URL. Defaults to the LIZ
+ * deployment running on the LAN. The endpoint speaks the OpenAI `/v1/embeddings`
+ * shape, so the request/response handling mirrors Voyage's.
+ */
+export const OMLX_EMBEDDINGS_URL =
+  process.env.OMLX_EMBEDDINGS_URL ||
+  process.env.OMLX_URL ||
+  "http://192.168.50.141:1234/v1/embeddings";
+
+/**
+ * Bearer token sent to the oMLX server. The LIZ deployment uses a permissive
+ * default; override via env var if your oMLX instance requires a real key.
+ */
+export const OMLX_API_KEY = process.env.OMLX_API_KEY || "1234567890";
+
+/**
+ * Model id passed to the oMLX server. "Embedding" is the alias LIZ uses for
+ * Qwen3-Embedding-8B-4bit-DWQ in its model registry.
+ */
+export const OMLX_EMBEDDING_MODEL =
+  process.env.OMLX_EMBEDDING_MODEL || "Embedding";
+
+/**
+ * Output dimensions for the oMLX embedding. Qwen3-Embedding-8B is natively
+ * 4096-dim but supports Matryoshka truncation; LIZ truncates to 1024 to match
+ * Voyage's shape so the rest of the pipeline (BLOB layout, dim grouping in the
+ * neighbour job) works identically across providers.
+ */
+export const OMLX_EMBEDDING_DIM = parseInt(
+  process.env.OMLX_EMBEDDING_DIM || "1024",
+  10,
+);
 
 /**
  * Cosine-similarity threshold above which two items are linked as `relates_to`

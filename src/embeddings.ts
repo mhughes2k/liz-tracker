@@ -18,6 +18,10 @@ import crypto from "crypto";
 
 import {
   EMBEDDING_PROVIDER,
+  OMLX_API_KEY,
+  OMLX_EMBEDDING_DIM,
+  OMLX_EMBEDDING_MODEL,
+  OMLX_EMBEDDINGS_URL,
   VOYAGE_API_KEY,
   VOYAGE_API_URL,
   VOYAGE_MODEL,
@@ -73,6 +77,8 @@ export async function embedText(
   const normalized = (text || "").slice(0, 32000); // Voyage hard cap is ~32k tokens; we slice on chars as a cheap safeguard.
 
   switch (provider) {
+    case "omlx":
+      return embedTextOmlx(normalized, opts?.model || OMLX_EMBEDDING_MODEL);
     case "voyage":
       return embedTextVoyage(normalized, opts?.model || VOYAGE_MODEL);
     case "anthropic":
@@ -160,6 +166,87 @@ async function embedTextVoyage(
     model: body.model || model,
     dim: vector.length,
     provider: "voyage",
+  };
+}
+
+/**
+ * Local oMLX (Qwen3-Embedding-8B-4bit-DWQ) embeddings.
+ *
+ * The oMLX server speaks the OpenAI `/v1/embeddings` shape, so the request and
+ * response handling mirrors Voyage's almost exactly — the only differences are
+ * the URL, the auth header value, and the extra `dimensions` field that asks
+ * Qwen for a Matryoshka-truncated 1024-dim vector instead of the native 4096.
+ *
+ * Why this is the default: tracker contents are private and must stay on the
+ * LAN. The same oMLX deployment already powers LIZ's memory search, so no new
+ * infrastructure is needed.
+ */
+async function embedTextOmlx(
+  text: string,
+  model: string,
+): Promise<EmbeddingResult> {
+  // Empty input would either 400 from the server or produce a zero vector —
+  // short-circuit on the client side so the worker can decide to skip cleanly.
+  if (!text.trim()) {
+    throw new EmbeddingProviderError(
+      "Refusing to embed empty text",
+      "omlx",
+    );
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(OMLX_EMBEDDINGS_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OMLX_API_KEY}`,
+      },
+      body: JSON.stringify({
+        input: [text],
+        model,
+        dimensions: OMLX_EMBEDDING_DIM,
+      }),
+    });
+  } catch (err) {
+    // Network errors (server down, unreachable) — surface as a provider error
+    // so the worker queue can back off and retry on the next tick rather than
+    // crash the orchestrator.
+    throw new EmbeddingProviderError(
+      `oMLX server unreachable at ${OMLX_EMBEDDINGS_URL}: ${(err as Error).message}`,
+      "omlx",
+    );
+  }
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new EmbeddingProviderError(
+      `oMLX API returned ${res.status}: ${errText.slice(0, 200)}`,
+      "omlx",
+      res.status,
+    );
+  }
+
+  const body = (await res.json()) as {
+    data?: Array<{ embedding?: number[] }>;
+    model?: string;
+  };
+  const raw = body?.data?.[0]?.embedding;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new EmbeddingProviderError(
+      "oMLX API response missing embedding data",
+      "omlx",
+    );
+  }
+
+  const vector = new Float32Array(raw.length);
+  for (let i = 0; i < raw.length; i++) vector[i] = raw[i];
+
+  return {
+    vector,
+    model: body.model || model,
+    dim: vector.length,
+    provider: "omlx",
   };
 }
 

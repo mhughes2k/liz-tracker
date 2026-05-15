@@ -1858,9 +1858,9 @@ function createMcpServer(): McpServer {
 
   server.tool(
     "tracker_agent_reference",
-    "Get comprehensive agent-facing reference documentation for all tracker space types (data formats, MCP tools, examples, caveats). Call this when you need detailed information about how to use a specific space type — it returns the authoritative, always-up-to-date reference directly from the tracker's space plugin system. Optionally filter by space_type to get only the reference for one space.",
+    "Get comprehensive agent-facing reference documentation for all tracker space types AND the cross-cutting Proposals workflow (the propose→review→apply pattern agents like Harmoni should use for multi-action batches). Call this when you need detailed information — it returns the authoritative, always-up-to-date reference directly from the tracker. Optionally filter by space_type (e.g. \"travel\", \"engagement\") or pass \"proposals\" to get only the Proposals section.",
     {
-      space_type: z.string().optional().describe("Filter to a specific space type (e.g. \"travel\", \"engagement\", \"scheduled\", \"song\", \"text\"). Omit to get all spaces."),
+      space_type: z.string().optional().describe("Filter to a specific space type (e.g. \"travel\", \"engagement\", \"scheduled\", \"song\", \"text\") OR pass \"proposals\" for just the Proposals workflow reference. Omit to get everything."),
     },
     async (args) => {
       const plugins = listSpacePlugins();
@@ -1908,6 +1908,89 @@ function createMcpServer(): McpServer {
       sections.push("- **Attachments** are key for song and engagement spaces — cover images and style files are stored as attachments, not in `space_data`.");
       sections.push("- **`space_data`** is a JSON string — always stringify when setting, parse when reading.");
       sections.push("- **Always prefer dedicated MCP tools** over raw `space_data` updates — they handle validation, coercion, and the GET-parse-modify-save cycle.");
+      sections.push("");
+
+      // Proposals workflow — agents must understand the propose→review→apply pattern
+      // so they batch multi-step cleanups behind a single human review point rather
+      // than firing off N individual mutations.
+      if (!targetType || targetType === "proposals") {
+        sections.push("## Proposals — multi-action batches for human review\n");
+        sections.push("When you want to make **multiple coordinated changes** to the tracker (e.g. cleaning up duplicates, reorganising items into a group, retitling a cluster + merging stragglers), use the **Proposals** workflow instead of firing individual mutations. The pattern is **propose → review → apply**: an agent stages a batch via `tracker_propose_batch`, a human reviews and accepts/rejects each action in the dashboard, then a human applies the accepted ones.");
+        sections.push("");
+        sections.push("### Why this exists\n");
+        sections.push("- One review point instead of N separate notifications/changes.");
+        sections.push("- Every action is auditable, reversible, and can be cherry-picked.");
+        sections.push("- Security: agents cannot apply proposals — only human actors can. Even within an apply, each action routes through its normal mutator, so existing actor-class rules still apply (e.g. agents still can't approve `requires_code` items, even via a proposal).");
+        sections.push("");
+        sections.push("### When to use Proposals vs direct MCP tools\n");
+        sections.push("- **Use Proposals** when: 2+ related changes; any merge/split/bulk action that needs review; touching items the human might want to vet individually; any \"cleanup\" or \"reorganise\" operation.");
+        sections.push("- **Use direct tools** when: adding a comment, watching an item, reading data — anything that doesn't mutate structure.");
+        sections.push("- **Default to Proposals for anything destructive or organisational.** A human's time to scan one proposal beats their time to scan five surprise edits.");
+        sections.push("");
+        sections.push("### MCP tools\n");
+        sections.push("| Tool | Description |");
+        sections.push("| --- | --- |");
+        sections.push("| `tracker_propose_batch` | Stage a batch of actions (status=pending). Returns the proposal + actions. **Use this**, not the individual mutators. |");
+        sections.push("| `tracker_list_proposals` | List staged proposals (filter by `status`, `since`). |");
+        sections.push("| `tracker_get_proposal` | Get a proposal with all its actions and their statuses. |");
+        sections.push("| `tracker_apply_proposal` | Apply accepted actions. **Rejected for agent callers** — humans only. |");
+        sections.push("");
+        sections.push("### Action kinds (each action's payload mirrors the matching mutator)\n");
+        sections.push("| Kind | Payload shape |");
+        sections.push("| --- | --- |");
+        sections.push("| `create_item` | `{project_id, title, description?, state?, priority?, assignee?, labels?, requires_code?, ...}` |");
+        sections.push("| `update_item` | `{item_id, title?, description?, priority?, assignee?, labels?, date_due?, link?}` |");
+        sections.push("| `change_state` | `{item_id, state, comment?}` |");
+        sections.push("| `add_link` | `{from_item_id, to_item_id, relation, note?}` — applied with `source='proposal'` |");
+        sections.push("| `remove_link` | `{from_item_id, to_item_id, relation}` |");
+        sections.push("| `merge_items` | `{target_id, source_ids[], strategy?, transfer_comments?, transfer_attachments?, transfer_links?}` |");
+        sections.push("| `split_item` | `{source_id, splits: [{title, description?, comment_regex?, labels?, priority?, target_project_id?}], preserve_source?}` |");
+        sections.push("| `bulk_update` | `{item_ids[], patch: {labels?: {add, remove}, priority?, assignee?, state?, project_id?, add_links?}}` |");
+        sections.push("");
+        sections.push("Item IDs in payloads accept either raw IDs (24-char hex) or display keys like `TRACK-5` — they're resolved at apply time.");
+        sections.push("");
+        sections.push("### Example: a cleanup batch\n");
+        sections.push("```");
+        sections.push("tracker_propose_batch({");
+        sections.push("  title: \"Tidy up the Moodle-strategy cluster\",");
+        sections.push("  summary: \"Five items look like duplicates of TRACK-200; suggest merging the stragglers and re-labeling.\",");
+        sections.push("  proposed_by: \"Harmoni\",");
+        sections.push("  expires_in_days: 7,");
+        sections.push("  actions: [");
+        sections.push("    {");
+        sections.push("      kind: \"merge_items\",");
+        sections.push("      payload: { target_id: \"TRACK-200\", source_ids: [\"TRACK-201\", \"TRACK-204\"] },");
+        sections.push("      rationale: \"Same underlying topic, drift-detector flagged both as near-duplicates of 200.\"");
+        sections.push("    },");
+        sections.push("    {");
+        sections.push("      kind: \"bulk_update\",");
+        sections.push("      payload: { item_ids: [\"TRACK-200\", \"TRACK-205\"], patch: { labels: { add: [\"moodle-strategy\"] } } },");
+        sections.push("      rationale: \"Common label for easier filtering.\"");
+        sections.push("    },");
+        sections.push("    {");
+        sections.push("      kind: \"add_link\",");
+        sections.push("      payload: { from_item_id: \"TRACK-200\", to_item_id: \"TRACK-205\", relation: \"relates_to\" },");
+        sections.push("      rationale: \"Strategy and rollout — closely linked.\"");
+        sections.push("    }");
+        sections.push("  ]");
+        sections.push("});");
+        sections.push("```");
+        sections.push("");
+        sections.push("After staging, the human sees a single Proposals badge in the topbar with the count of pending batches. They drill in, accept/reject each row, and click Apply. The runtime executes each accepted action through its normal mutator, captures per-action results, and marks the proposal `applied` / `partially_applied` / `rejected` / `expired` as appropriate.");
+        sections.push("");
+        sections.push("### Lifecycle status values\n");
+        sections.push("- `pending` — staged, awaiting any action.");
+        sections.push("- `partially_applied` — some actions applied, others still pending or rejected.");
+        sections.push("- `applied` — all accepted actions ran successfully.");
+        sections.push("- `rejected` — the human cancelled the whole batch.");
+        sections.push("- `expired` — auto-marked after `expires_at` if not actioned (default 7 days from staging).");
+        sections.push("");
+        sections.push("### Security boundary (read this before using these tools)\n");
+        sections.push("- `tracker_propose_batch` **always** records `proposed_by_class='agent'` regardless of what you claim. You can't impersonate a human.");
+        sections.push("- `tracker_apply_proposal` **rejects** agent/system/api callers at the boundary with the error `\"Only human actors can apply proposals.\"`. Don't attempt to apply your own proposals — stage them and let the human apply.");
+        sections.push("- Each action inside an apply still goes through the regular mutator (e.g. `changeWorkItemState`), so per-item security rules continue to apply.");
+        sections.push("");
+      }
 
       return { content: [{ type: "text", text: sections.join("\n") }] };
     },

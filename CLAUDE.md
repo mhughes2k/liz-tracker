@@ -16,7 +16,7 @@ Standalone project management tracker with kanban UI, REST API, MCP tools, and O
 | File | Description |
 | --- | --- |
 | `src/index.ts` | Entry point — init DB, start server, optionally start orchestrator |
-| `src/config.ts` | Config from env vars / `.env` file: PORT, STORE_DIR, TRACKER_PUBLIC_URL, TRACKER_SHORT_URL, OPENCODE_SERVER_URL, OPENCODE_PUBLIC_URL, ORCHESTRATOR_ENABLED, ORCHESTRATOR_INTERVAL, OPENCODE_MAX_CONCURRENT, OPENCODE_MAX_PER_PROJECT, ANTHROPIC_API_KEY, AI_CATEGORIZE_MODEL, DECKWRIGHT_URL, EMBEDDING_PROVIDER, VOYAGE_API_KEY, VOYAGE_MODEL |
+| `src/config.ts` | Config from env vars / `.env` file: PORT, STORE_DIR, TRACKER_PUBLIC_URL, TRACKER_SHORT_URL, OPENCODE_SERVER_URL, OPENCODE_PUBLIC_URL, ORCHESTRATOR_ENABLED, ORCHESTRATOR_INTERVAL, OPENCODE_MAX_CONCURRENT, OPENCODE_MAX_PER_PROJECT, ANTHROPIC_API_KEY, AI_CATEGORIZE_MODEL, DECKWRIGHT_URL, EMBEDDING_PROVIDER, OMLX_EMBEDDINGS_URL, OMLX_API_KEY, OMLX_EMBEDDING_MODEL, OMLX_EMBEDDING_DIM, VOYAGE_API_KEY, VOYAGE_MODEL |
 | `src/embeddings.ts` | Embedding provider abstraction — Voyage, Anthropic (fallback), local/mock providers. Vector math: cosineSimilarity, encode/decodeVector, textHash, buildItemEmbeddingText |
 | `src/embeddings-worker.ts` | Worker: debounced refresh queue (30s), nightly neighbour computation (top-K), drift score, clustering (connected components) |
 | `src/logger.ts` | Pino logger with pino-pretty |
@@ -804,9 +804,10 @@ Tracker maintains a small vector index of every work item so the dashboard can s
 
 | `EMBEDDING_PROVIDER` | Behaviour |
 | --- | --- |
-| `voyage` | Production. Posts to `VOYAGE_API_URL` with model `VOYAGE_MODEL` (default `voyage-3`, 1024 dim). Requires `VOYAGE_API_KEY` |
+| `omlx` | **Default.** Posts to a local OpenAI-compatible oMLX server (default `http://192.168.50.141:1234/v1/embeddings`) running Qwen3-Embedding-8B-4bit-DWQ. Matryoshka-truncated to 1024 dim. Private data stays on the LAN — same model LIZ uses for memory search |
+| `voyage` | Cloud fallback. Posts to `VOYAGE_API_URL` with model `VOYAGE_MODEL` (default `voyage-3`, 1024 dim). Requires `VOYAGE_API_KEY`. **Do not enable for private data** — text leaves the LAN |
 | `anthropic` | Falls back to `local` with a one-time warning. No public Anthropic embeddings API exists yet |
-| `local` / `mock` | Default. Deterministic SHA-256-derived 256-dim L2-normalized vector. Identical text always yields identical vector — enough for tests and offline operation, but NOT semantically meaningful |
+| `local` / `mock` | Deterministic SHA-256-derived 256-dim L2-normalized vector. Identical text always yields identical vector — enough for tests and offline operation, but NOT semantically meaningful. The test harness forces this via `vitest.config.ts` |
 
 ### Compute pipeline
 
@@ -819,7 +820,11 @@ Tracker maintains a small vector index of every work item so the dashboard can s
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `EMBEDDING_PROVIDER` | `local` | `voyage` | `anthropic` | `local` | `mock` |
+| `EMBEDDING_PROVIDER` | `omlx` | `omlx` \| `voyage` \| `anthropic` \| `local` \| `mock` |
+| `OMLX_EMBEDDINGS_URL` | `http://192.168.50.141:1234/v1/embeddings` | oMLX server URL (OpenAI-compatible) |
+| `OMLX_API_KEY` | `1234567890` | Bearer token sent to oMLX |
+| `OMLX_EMBEDDING_MODEL` | `Embedding` | Model alias passed to oMLX |
+| `OMLX_EMBEDDING_DIM` | `1024` | Matryoshka-truncated output dimensions |
 | `VOYAGE_API_KEY` | — | Required when provider=voyage |
 | `VOYAGE_MODEL` | `voyage-3` | Voyage model id |
 | `VOYAGE_API_URL` | `https://api.voyageai.com/v1/embeddings` | Override for self-hosted gateways |
