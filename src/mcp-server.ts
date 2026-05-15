@@ -245,6 +245,44 @@ function resolveId(idOrKey: string): string {
   return idOrKey;
 }
 
+// ── MCP Schema Coercion Helpers (TRACK-287) ──
+// LLM clients sometimes serialize array/boolean params as strings (e.g.
+// labels="bug,urgent" or requires_code="true"). These preprocessors coerce
+// those common mis-types into the expected type so the call doesn't fail with
+// a validation error on the first attempt.
+
+/** String → boolean coercion: "true"/"1"/"yes" → true, "false"/"0"/"no" → false. */
+export function coerceBoolean(val: unknown): unknown {
+  if (typeof val !== "string") return val;
+  const trimmed = val.trim().toLowerCase();
+  if (trimmed === "true" || trimmed === "1" || trimmed === "yes") return true;
+  if (trimmed === "false" || trimmed === "0" || trimmed === "no") return false;
+  return val;
+}
+
+/** String → string[] coercion: JSON array string or comma-separated string. */
+export function coerceStringArray(val: unknown): unknown {
+  if (typeof val !== "string") return val;
+  const trimmed = val.trim();
+  if (trimmed === "") return [];
+  // Try JSON parse for array-shaped strings: '["a","b"]'
+  if (trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return parsed.map((v) => String(v));
+    } catch {
+      // fall through to comma-split
+    }
+  }
+  // Comma-separated: "bug, urgent" → ["bug", "urgent"]
+  return trimmed.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+/** Tolerant boolean schema for MCP tool inputs. */
+const lenientBoolean = () => z.preprocess(coerceBoolean, z.boolean());
+/** Tolerant string-array schema for MCP tool inputs. */
+const lenientStringArray = () => z.preprocess(coerceStringArray, z.array(z.string()));
+
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "tracker",
@@ -303,16 +341,16 @@ function createMcpServer(): McpServer {
       state: z.string().optional().describe(`Initial state (default: brainstorming)`),
       priority: z.string().optional().describe(`Priority (default: none)`),
       assignee: z.string().optional().describe("Assignee name"),
-      labels: z.array(z.string()).optional().describe("Labels/tags"),
-      requires_code: z.boolean().optional().describe("Whether this item requires code changes"),
-      bot_dispatch: z.boolean().optional().describe("Whether to dispatch this item to the bot for processing"),
+      labels: lenientStringArray().optional().describe('Labels/tags as an ARRAY of strings, e.g. ["bug", "urgent"]. A comma-separated string ("bug, urgent") or JSON array string is also accepted.'),
+      requires_code: lenientBoolean().optional().describe('Whether this item requires code changes. Must be a BOOLEAN (true or false), not a string. Strings "true"/"false"/"1"/"0" are also accepted.'),
+      bot_dispatch: lenientBoolean().optional().describe('Whether to dispatch this item to the bot for processing. Must be a BOOLEAN (true or false), not a string. Strings "true"/"false"/"1"/"0" are also accepted.'),
       platform: z.enum(["any", "server", "ios", "web"]).optional().describe("Target platform"),
       date_due: z.string().optional().describe("Due date in YYYY-MM-DD format (optional)"),
       link: z.string().optional().describe("Optional URL link associated with this item"),
       space_type: z.string().optional().describe('Space type for specialized UI (e.g. "standard", "song", "engagement", "scheduled"). Default: "standard"'),
       space_data: z.string().optional().describe('JSON string for space-specific custom fields. For scheduled tasks, prefer the dedicated tracker_add_scheduled_todo/tracker_remove_scheduled_todo tools. For engagement items, prefer the dedicated tracker_update_engagement_contact/tracker_update_engagement_quote/tracker_add_engagement_milestone/tracker_add_engagement_comms tools. For travel items, prefer tracker_update_travel_trip and tracker_add_travel_segment tools — they handle the GET-parse-modify-save cycle automatically and validate segment structure.'),
       created_by: z.string().optional().describe("Ignored — MCP items are always attributed to Harmoni for security (TRACK-213)"),
-      blocked_by: z.array(z.string()).optional().describe('Item IDs or display keys (e.g. "TRACK-5") that block this item. The blocked item cannot be worked on until all blockers are done/testing/cancelled.'),
+      blocked_by: lenientStringArray().optional().describe('Item IDs or display keys (e.g. ["TRACK-5", "TRACK-6"]) that block this item, as an ARRAY of strings. The blocked item cannot be worked on until all blockers are done/testing/cancelled.'),
     },
     async (args) => {
       const project = getProject(args.project_id);
@@ -431,8 +469,8 @@ function createMcpServer(): McpServer {
       description: z.string().optional().describe("New description"),
       priority: z.string().optional().describe("New priority"),
       assignee: z.string().optional().describe("New assignee (empty to unassign)"),
-      requires_code: z.boolean().optional().describe("Whether this item requires code changes"),
-      bot_dispatch: z.boolean().optional().describe("Whether to dispatch this item to the bot for processing"),
+      requires_code: lenientBoolean().optional().describe('Whether this item requires code changes. Must be a BOOLEAN (true or false), not a string. Strings "true"/"false"/"1"/"0" are also accepted.'),
+      bot_dispatch: lenientBoolean().optional().describe('Whether to dispatch this item to the bot for processing. Must be a BOOLEAN (true or false), not a string. Strings "true"/"false"/"1"/"0" are also accepted.'),
       platform: z.enum(["any", "server", "ios", "web"]).optional().describe("Target platform"),
       date_due: z.string().optional().describe("Due date in YYYY-MM-DD format. Pass empty string to clear."),
       link: z.string().optional().describe("Optional URL link associated with this item. Pass empty string to clear."),
