@@ -11500,21 +11500,24 @@
 
         // Lazy CDN loaders. Returns a promise that resolves once the library's
         // global is available. Cached so duplicate calls share a single fetch.
-        // SRI is intentionally omitted — cdnjs occasionally rebuilds packages,
+        // SRI is intentionally omitted — CDNs occasionally rebuild packages,
         // and a stale hash bricks the whole expand-card UX. URL pinning + CORS
         // is the fallback per the Phase 2 plan.
+        // diff2html is served from jsDelivr because cdnjs does not actually
+        // host the diff2html bundle files (every asset 404s), which caused the
+        // CSS to silently fail to load and rendered diffs colourless.
         let _diff2htmlPromise = null;
         function _ensureDiff2Html() {
           if (_diff2htmlPromise) return _diff2htmlPromise;
           _diff2htmlPromise = new Promise((resolve, reject) => {
             const link = document.createElement('link');
             link.rel = 'stylesheet';
-            link.href = 'https://cdnjs.cloudflare.com/ajax/libs/diff2html/3.4.51/diff2html.min.css';
+            link.href = 'https://cdn.jsdelivr.net/npm/diff2html@3.4.51/bundles/css/diff2html.min.css';
             link.crossOrigin = 'anonymous';
             link.referrerPolicy = 'no-referrer';
             document.head.appendChild(link);
             const s = document.createElement('script');
-            s.src = 'https://cdnjs.cloudflare.com/ajax/libs/diff2html/3.4.51/diff2html-ui.min.js';
+            s.src = 'https://cdn.jsdelivr.net/npm/diff2html@3.4.51/bundles/js/diff2html-ui.min.js';
             s.crossOrigin = 'anonymous';
             s.referrerPolicy = 'no-referrer';
             s.onload = () => resolve(window.Diff2HtmlUI);
@@ -12123,7 +12126,10 @@
               drawFileList: false,
               matching: 'lines',
               outputFormat: 'line-by-line',
-              colorScheme: 'auto',
+              // Tracker is always a dark theme regardless of OS prefers-color-scheme,
+              // so force the dark palette explicitly — 'auto' would render with
+              // light backgrounds on macOS in Light mode against our dark surface.
+              colorScheme: 'dark',
             });
             ui.draw();
           } catch (err) {
