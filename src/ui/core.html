@@ -17565,7 +17565,7 @@
           if (!id) return;
           const key = cardEl.querySelector('.card-key')?.textContent || '';
           const title = cardEl.querySelector('.card-title')?.textContent || '';
-          cardMetaCache.set(id, { key, title });
+          cardMetaCache.set(id, { id, key, title });
         }
 
         function syncMultiSelectVisuals() {
