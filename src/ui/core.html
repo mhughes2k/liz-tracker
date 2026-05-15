@@ -11498,28 +11498,23 @@
         /** Active EventSource connections by item ID (for cleanup) */
         const _sessionViewerSources = new Map();
 
-        // Lazy CDN loaders. Returns a promise that resolves once the library's
-        // global is available. Cached so duplicate calls share a single fetch.
-        // SRI is intentionally omitted — CDNs occasionally rebuild packages,
-        // and a stale hash bricks the whole expand-card UX. URL pinning + CORS
-        // is the fallback per the Phase 2 plan.
-        // diff2html is served from jsDelivr because cdnjs does not actually
-        // host the diff2html bundle files (every asset 404s), which caused the
-        // CSS to silently fail to load and rendered diffs colourless.
+        // Lazy loaders for diff2html + highlight.js. Both libraries are
+        // vendored under /vendor/ so the tracker stays fully local and
+        // self-sufficient — no network round-trip to a third-party CDN, and
+        // no failure mode if the user is offline or behind a strict firewall.
+        // See src/ui/vendor/ for the pinned copies (diff2html 3.4.51 slim
+        // bundle, highlight.js 11.10.0). Cached so duplicate calls share a
+        // single fetch.
         let _diff2htmlPromise = null;
         function _ensureDiff2Html() {
           if (_diff2htmlPromise) return _diff2htmlPromise;
           _diff2htmlPromise = new Promise((resolve, reject) => {
             const link = document.createElement('link');
             link.rel = 'stylesheet';
-            link.href = 'https://cdn.jsdelivr.net/npm/diff2html@3.4.51/bundles/css/diff2html.min.css';
-            link.crossOrigin = 'anonymous';
-            link.referrerPolicy = 'no-referrer';
+            link.href = '/vendor/diff2html.min.css';
             document.head.appendChild(link);
             const s = document.createElement('script');
-            s.src = 'https://cdn.jsdelivr.net/npm/diff2html@3.4.51/bundles/js/diff2html-ui.min.js';
-            s.crossOrigin = 'anonymous';
-            s.referrerPolicy = 'no-referrer';
+            s.src = '/vendor/diff2html-ui.min.js';
             s.onload = () => resolve(window.Diff2HtmlUI);
             s.onerror = () => { _diff2htmlPromise = null; reject(new Error('diff2html failed to load')); };
             document.head.appendChild(s);
@@ -11533,14 +11528,10 @@
           _hljsPromise = new Promise((resolve, reject) => {
             const link = document.createElement('link');
             link.rel = 'stylesheet';
-            link.href = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/styles/github-dark.min.css';
-            link.crossOrigin = 'anonymous';
-            link.referrerPolicy = 'no-referrer';
+            link.href = '/vendor/highlight-github-dark.min.css';
             document.head.appendChild(link);
             const s = document.createElement('script');
-            s.src = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/highlight.min.js';
-            s.crossOrigin = 'anonymous';
-            s.referrerPolicy = 'no-referrer';
+            s.src = '/vendor/highlight.min.js';
             s.onload = () => resolve(window.hljs);
             s.onerror = () => { _hljsPromise = null; reject(new Error('highlight.js failed to load')); };
             document.head.appendChild(s);
