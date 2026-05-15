@@ -972,7 +972,7 @@ The dashboard is a single vanilla JS file wrapped in an IIFE. No frameworks. The
 
 ### Navigation
 
-The code is organized into ~76 sections, each marked with a comment header:
+The code is organized into ~78 sections, each marked with a comment header:
 ```js
 // ── Section Name ──
 ```
@@ -980,7 +980,7 @@ When adding new features, always add a section header. Use grep for `// ──` 
 
 ### Shared Helpers & Constants
 
-Reusable utilities are in the **"Shared Helpers"** section (line ~12455). Check here before writing new utility code:
+Reusable utilities are in the **"Shared Helpers"** section (line ~12487). Check here before writing new utility code:
 
 | Helper | Purpose |
 | --- | --- |
@@ -995,7 +995,7 @@ Reusable utilities are in the **"Shared Helpers"** section (line ~12455). Check 
 | `buildOpencodeUrl(sessionId, dir)` | Build OpenCode deep link URL |
 | `base64UrlEncode(str)` | Encode string to base64url (for OpenCode directory paths) |
 
-Shared constants (defined near the top of the JS, line ~11174):
+Shared constants (defined near the top of the JS, line ~11209):
 
 | Constant | Purpose |
 | --- | --- |
