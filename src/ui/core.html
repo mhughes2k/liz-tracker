@@ -10026,6 +10026,13 @@
         <button class="today-control-btn" id="proposalsBtn" title="Proposals from agents">
           <span class="today-btn-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg></span> Proposals <span id="proposalsPendingBadge" style="display:none;margin-left:4px;padding:1px 6px;border-radius:8px;background:var(--accent,#3b82f6);color:#fff;font-size:0.7rem;font-weight:600;"></span>
         </button>
+        <!-- TRACK-289: pull-only embeddings views, no auto-popup, no badges -->
+        <button class="today-control-btn" id="mergeCandidatesBtn" title="Embedding-suggested merge candidates">
+          <span class="today-btn-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v4a4 4 0 0 0 4 4h0a4 4 0 0 0 4-4V3"/><line x1="12" y1="11" x2="12" y2="21"/><polyline points="8 17 12 21 16 17"/></svg></span> Merge Candidates
+        </button>
+        <button class="today-control-btn" id="topicsBtn" title="Topic clusters from embeddings">
+          <span class="today-btn-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><line x1="8" y1="8" x2="11" y2="15"/><line x1="16" y1="8" x2="13" y2="15"/></svg></span> Topics
+        </button>
         <div style="flex: 1"></div>
         <div class="sort-control">
           <label class="sort-label" for="sortMode">Sort:</label>
@@ -10612,6 +10619,34 @@
         </select>
       </div>
       <div class="activity-panel-list" id="proposalsList"></div>
+    </div>
+
+    <!-- Merge Candidates Panel (TRACK-289) — pull-only, no badges -->
+    <div class="activity-panel-overlay" id="mergeCandidatesPanelOverlay"></div>
+    <div class="activity-panel" id="mergeCandidatesPanel">
+      <div class="activity-panel-header">
+        <h2>Merge Candidates</h2>
+        <button class="activity-panel-refresh" id="mergeCandidatesRefreshBtn" title="Refresh">&#8635;</button>
+        <button class="activity-panel-close" id="mergeCandidatesCloseBtn" title="Close">&times;</button>
+      </div>
+      <div class="activity-panel-filters">
+        <label style="font-size:0.78rem;color:var(--text-dim);display:flex;align-items:center;gap:6px">
+          Min similarity
+          <input type="number" id="mergeCandidatesThreshold" min="0.5" max="0.99" step="0.01" value="0.92" style="width:70px" />
+        </label>
+      </div>
+      <div class="activity-panel-list" id="mergeCandidatesList"></div>
+    </div>
+
+    <!-- Topics Panel (TRACK-289) — pull-only, no badges -->
+    <div class="activity-panel-overlay" id="topicsPanelOverlay"></div>
+    <div class="activity-panel" id="topicsPanel">
+      <div class="activity-panel-header">
+        <h2 id="topicsPanelTitle">Topics</h2>
+        <button class="activity-panel-refresh" id="topicsRefreshBtn" title="Refresh">&#8635;</button>
+        <button class="activity-panel-close" id="topicsCloseBtn" title="Close">&times;</button>
+      </div>
+      <div class="activity-panel-list" id="topicsList"></div>
     </div>
 
     <!-- Space Overlay (modal workspace for specialized item types) -->
@@ -20593,6 +20628,13 @@
           if (e.key === "Escape" && $("#proposalsPanel").classList.contains("open")) {
             closeProposalsPanel();
           }
+          // TRACK-289: dismiss merge candidates / topics panels on Escape
+          if (e.key === "Escape" && $("#mergeCandidatesPanel")?.classList.contains("open")) {
+            closeMergeCandidatesPanel();
+          }
+          if (e.key === "Escape" && $("#topicsPanel")?.classList.contains("open")) {
+            closeTopicsPanel();
+          }
         });
 
         // ── Proposals (TRACK-284) ──
@@ -20783,6 +20825,421 @@
         // Refresh badge initially and every 60s
         refreshProposalsBadge();
         setInterval(refreshProposalsBadge, 60000);
+
+        // ── Merge Candidates Panel (TRACK-289) ──
+        // Pull-only view of embedding-suggested merge pairs. No badges, no
+        // auto-popup — opened only when the user clicks the topbar button.
+        // Reuses the existing merge modal (#mergeModal) by populating
+        // multiSelectIds + cardMetaCache, so target picker and submit logic
+        // are unchanged.
+
+        function openMergeCandidatesPanel() {
+          $("#mergeCandidatesPanel").classList.add("open");
+          $("#mergeCandidatesPanelOverlay").classList.add("open");
+          loadMergeCandidates();
+        }
+
+        function closeMergeCandidatesPanel() {
+          $("#mergeCandidatesPanel").classList.remove("open");
+          $("#mergeCandidatesPanelOverlay").classList.remove("open");
+        }
+
+        async function loadMergeCandidates() {
+          const listEl = $("#mergeCandidatesList");
+          const threshold = parseFloat($("#mergeCandidatesThreshold").value) || 0.92;
+          listEl.innerHTML = '<div class="activity-empty">Loading…</div>';
+          try {
+            const params = new URLSearchParams();
+            params.set("threshold", String(threshold));
+            params.set("limit", "50");
+            const pairs = await apiGet(`/embeddings/merge-candidates?${params}`);
+            if (!Array.isArray(pairs) || pairs.length === 0) {
+              listEl.innerHTML = '<div class="activity-empty">No merge candidates above threshold. Try lowering the minimum similarity.</div>';
+              return;
+            }
+            listEl.innerHTML = "";
+            for (const pair of pairs) listEl.appendChild(buildMergeCandidateRow(pair));
+          } catch (e) {
+            listEl.innerHTML = '<div class="activity-empty">Failed to load candidates</div>';
+          }
+        }
+
+        function projectShortName(projectId) {
+          const proj = (projectsCache || []).find((p) => p.id === projectId);
+          return proj ? (proj.short_name || proj.name || "???") : "???";
+        }
+
+        function buildMergeCandidateRow(pair) {
+          const row = document.createElement("div");
+          row.className = "proposal-row";
+          row.style.cssText = "border-bottom:1px solid var(--border);padding:10px 12px";
+
+          const sim = typeof pair.similarity === "number" ? pair.similarity.toFixed(3) : "—";
+          const aProj = projectShortName(pair.a.project_id);
+          const bProj = projectShortName(pair.b.project_id);
+
+          const header = document.createElement("div");
+          header.style.cssText = "display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:4px";
+          header.innerHTML = `
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+              <strong>${esc(pair.a.key || aProj)}</strong>
+              <span style="color:var(--text-dim)">↔</span>
+              <strong>${esc(pair.b.key || bProj)}</strong>
+            </div>
+            <span style="font-size:0.72rem;padding:2px 6px;border-radius:4px;background:var(--surface-alt);color:var(--text-dim)">sim ${esc(sim)}</span>
+          `;
+          row.appendChild(header);
+
+          const titles = document.createElement("div");
+          titles.style.cssText = "font-size:0.82rem;line-height:1.4;margin-bottom:6px";
+          titles.innerHTML = `
+            <div><span style="color:var(--text-dim)">A:</span> ${esc(pair.a.title || "(untitled)")}</div>
+            <div><span style="color:var(--text-dim)">B:</span> ${esc(pair.b.title || "(untitled)")}</div>
+          `;
+          row.appendChild(titles);
+
+          const preview = document.createElement("div");
+          preview.className = "merge-candidate-preview";
+          preview.style.cssText = "display:none;margin:6px 0;padding:8px;background:var(--surface-alt);border-radius:4px;font-size:0.78rem";
+          row.appendChild(preview);
+
+          const actions = document.createElement("div");
+          actions.style.cssText = "display:flex;gap:6px;flex-wrap:wrap";
+
+          const previewBtn = document.createElement("button");
+          previewBtn.className = "today-control-btn";
+          previewBtn.textContent = "Preview";
+          previewBtn.addEventListener("click", async (e) => {
+            e.stopPropagation();
+            if (preview.style.display === "block") {
+              preview.style.display = "none";
+              return;
+            }
+            preview.innerHTML = '<div style="color:var(--text-dim)">Loading…</div>';
+            preview.style.display = "block";
+            try {
+              const [aItem, bItem] = await Promise.all([
+                apiGet(`/items/${pair.a.id}`),
+                apiGet(`/items/${pair.b.id}`),
+              ]);
+              preview.innerHTML = `
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+                  <div>
+                    <div style="font-weight:600;margin-bottom:4px">${esc(pair.a.key || "")} — ${esc(aItem.title || "")}</div>
+                    <div style="white-space:pre-wrap;color:var(--text-dim);max-height:240px;overflow:auto">${esc(aItem.description || "(no description)")}</div>
+                  </div>
+                  <div>
+                    <div style="font-weight:600;margin-bottom:4px">${esc(pair.b.key || "")} — ${esc(bItem.title || "")}</div>
+                    <div style="white-space:pre-wrap;color:var(--text-dim);max-height:240px;overflow:auto">${esc(bItem.description || "(no description)")}</div>
+                  </div>
+                </div>
+              `;
+            } catch (err) {
+              preview.innerHTML = '<div style="color:var(--text-dim)">Failed to load preview.</div>';
+            }
+          });
+          actions.appendChild(previewBtn);
+
+          const mergeBtn = document.createElement("button");
+          mergeBtn.className = "today-control-btn";
+          mergeBtn.textContent = "Merge…";
+          mergeBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            openMergeModalForPair(pair);
+          });
+          actions.appendChild(mergeBtn);
+
+          const dismissBtn = document.createElement("button");
+          dismissBtn.className = "today-control-btn";
+          dismissBtn.textContent = "Dismiss";
+          dismissBtn.title = "Record as 'not duplicates' — pair won't reappear";
+          dismissBtn.addEventListener("click", async (e) => {
+            e.stopPropagation();
+            try {
+              await apiPost(`/embeddings/tombstones`, {
+                item_a: pair.a.id,
+                item_b: pair.b.id,
+                reason: "dismissed-from-merge-candidates",
+              });
+              toast("Pair dismissed");
+              row.remove();
+              if (!$("#mergeCandidatesList").firstChild) {
+                $("#mergeCandidatesList").innerHTML = '<div class="activity-empty">No merge candidates above threshold.</div>';
+              }
+            } catch (err) {
+              toast("Failed to dismiss: " + (err?.message || err), "error");
+            }
+          });
+          actions.appendChild(dismissBtn);
+
+          row.appendChild(actions);
+          return row;
+        }
+
+        function openMergeModalForPair(pair) {
+          // Prefill the existing merge modal by simulating a 2-item selection.
+          // The modal's submit handler reads multiSelectIds + cardMetaCache,
+          // so we set those rather than duplicating merge logic.
+          // Default target = the higher seq-number key, which is usually the
+          // newer/more-detailed item; user can flip in the modal dropdown.
+          if (typeof multiSelectIds === "undefined" || typeof cardMetaCache === "undefined") {
+            toast("Merge modal not available", "error");
+            return;
+          }
+          multiSelectIds.clear();
+          cardMetaCache.set(pair.a.id, { id: pair.a.id, key: pair.a.key, title: pair.a.title });
+          cardMetaCache.set(pair.b.id, { id: pair.b.id, key: pair.b.key, title: pair.b.title });
+          multiSelectIds.add(pair.a.id);
+          multiSelectIds.add(pair.b.id);
+          openMergeModal();
+
+          // Default target = higher seq-number (rough proxy for "newer").
+          const seqA = parseInt(String(pair.a.key || "").split("-").pop() || "0", 10);
+          const seqB = parseInt(String(pair.b.key || "").split("-").pop() || "0", 10);
+          const defaultTarget = seqA >= seqB ? pair.a.id : pair.b.id;
+          const targetSel = $("#mergeModalTarget");
+          if (targetSel) targetSel.value = defaultTarget;
+
+          // After the modal closes (successful merge calls refreshCurrentView),
+          // refresh the candidates list so the merged pair disappears. Hook
+          // into the modal submit button once.
+          const submitBtn = $("#mergeModalSubmit");
+          if (submitBtn && !submitBtn._mcReload) {
+            submitBtn._mcReload = true;
+            submitBtn.addEventListener("click", () => {
+              setTimeout(() => {
+                if ($("#mergeCandidatesPanel").classList.contains("open")) loadMergeCandidates();
+              }, 600);
+            });
+          }
+        }
+
+        $("#mergeCandidatesBtn").addEventListener("click", openMergeCandidatesPanel);
+        $("#mergeCandidatesCloseBtn").addEventListener("click", closeMergeCandidatesPanel);
+        $("#mergeCandidatesPanelOverlay").addEventListener("click", closeMergeCandidatesPanel);
+        $("#mergeCandidatesRefreshBtn").addEventListener("click", loadMergeCandidates);
+        $("#mergeCandidatesThreshold").addEventListener("change", loadMergeCandidates);
+
+        // ── Topics Panel (TRACK-289) ──
+        // Pull-only cluster view. Inline rename via PATCH /embeddings/clusters/:id/label.
+        // Drill-in shows all members + "Group these" (calls POST /items/group).
+
+        function openTopicsPanel() {
+          $("#topicsPanel").classList.add("open");
+          $("#topicsPanelOverlay").classList.add("open");
+          loadTopics();
+        }
+
+        function closeTopicsPanel() {
+          $("#topicsPanel").classList.remove("open");
+          $("#topicsPanelOverlay").classList.remove("open");
+        }
+
+        async function loadTopics() {
+          const listEl = $("#topicsList");
+          $("#topicsPanelTitle").textContent = "Topics";
+          listEl.innerHTML = '<div class="activity-empty">Loading…</div>';
+          try {
+            const clusters = await apiGet(`/embeddings/topics`);
+            if (!Array.isArray(clusters) || clusters.length === 0) {
+              listEl.innerHTML = '<div class="activity-empty">No topic clusters yet. The nightly neighbour job builds these — try recomputing embeddings.</div>';
+              return;
+            }
+            // Sort by size desc, then by cluster_id for stability.
+            clusters.sort((a, b) => (b.size - a.size) || (a.cluster_id - b.cluster_id));
+            listEl.innerHTML = "";
+            for (const c of clusters) listEl.appendChild(buildTopicRow(c));
+          } catch (e) {
+            listEl.innerHTML = '<div class="activity-empty">Failed to load topics</div>';
+          }
+        }
+
+        function buildTopicRow(cluster) {
+          const row = document.createElement("div");
+          row.className = "proposal-row";
+          row.style.cssText = "border-bottom:1px solid var(--border);padding:10px 12px;cursor:pointer";
+
+          const rep = (cluster.members || []).find((m) => m.is_representative) || (cluster.members || [])[0];
+          const repKey = rep ? rep.key : "—";
+          const titlesPreview = (cluster.members || [])
+            .slice(0, 3)
+            .map((m) => m.title || "(untitled)")
+            .join(" • ");
+
+          const header = document.createElement("div");
+          header.style.cssText = "display:flex;justify-content:space-between;gap:8px;align-items:center";
+          const labelSpan = document.createElement("span");
+          labelSpan.className = "topic-label";
+          labelSpan.style.cssText = "font-weight:600;flex:1;cursor:text;padding:2px 4px;border-radius:3px";
+          labelSpan.textContent = cluster.label || `Cluster #${cluster.cluster_id}`;
+          labelSpan.title = "Click to rename";
+          labelSpan.addEventListener("click", (e) => {
+            e.stopPropagation();
+            startRenameCluster(cluster, labelSpan);
+          });
+          header.appendChild(labelSpan);
+
+          const meta = document.createElement("span");
+          meta.style.cssText = "font-size:0.72rem;color:var(--text-dim);white-space:nowrap";
+          meta.textContent = `${cluster.size} items • rep ${repKey}`;
+          header.appendChild(meta);
+          row.appendChild(header);
+
+          const preview = document.createElement("div");
+          preview.style.cssText = "font-size:0.78rem;color:var(--text-dim);margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+          preview.textContent = titlesPreview;
+          row.appendChild(preview);
+
+          row.addEventListener("click", () => openClusterDetail(cluster));
+          return row;
+        }
+
+        function startRenameCluster(cluster, labelSpan) {
+          const input = document.createElement("input");
+          input.type = "text";
+          input.value = cluster.label || "";
+          input.style.cssText = "font-weight:600;flex:1;padding:2px 4px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--text)";
+          labelSpan.replaceWith(input);
+          input.focus();
+          input.select();
+
+          let finished = false;
+          const finish = async (commit) => {
+            if (finished) return;
+            finished = true;
+            const newLabel = input.value.trim();
+            const restore = document.createElement("span");
+            restore.className = "topic-label";
+            restore.style.cssText = labelSpan.style.cssText;
+            restore.title = "Click to rename";
+            restore.addEventListener("click", (e) => {
+              e.stopPropagation();
+              startRenameCluster(cluster, restore);
+            });
+            if (commit && newLabel !== (cluster.label || "")) {
+              try {
+                await apiPatch(`/embeddings/clusters/${encodeURIComponent(cluster.cluster_id)}/label`, { label: newLabel });
+                cluster.label = newLabel;
+                restore.textContent = newLabel || `Cluster #${cluster.cluster_id}`;
+                toast("Cluster renamed");
+              } catch (err) {
+                toast("Failed to rename: " + (err?.message || err), "error");
+                restore.textContent = cluster.label || `Cluster #${cluster.cluster_id}`;
+              }
+            } else {
+              restore.textContent = cluster.label || `Cluster #${cluster.cluster_id}`;
+            }
+            input.replaceWith(restore);
+          };
+
+          input.addEventListener("blur", () => finish(true));
+          input.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") { e.preventDefault(); finish(true); }
+            if (e.key === "Escape") { e.preventDefault(); finish(false); }
+          });
+          input.addEventListener("click", (e) => e.stopPropagation());
+        }
+
+        function openClusterDetail(cluster) {
+          const listEl = $("#topicsList");
+          $("#topicsPanelTitle").textContent = cluster.label || `Cluster #${cluster.cluster_id}`;
+          const members = cluster.members || [];
+
+          const wrap = document.createElement("div");
+          wrap.style.cssText = "padding:12px";
+
+          const back = document.createElement("button");
+          back.className = "today-control-btn";
+          back.textContent = "← Back";
+          back.style.marginBottom = "8px";
+          back.addEventListener("click", () => loadTopics());
+          wrap.appendChild(back);
+
+          const title = document.createElement("h3");
+          title.style.cssText = "margin:0 0 4px 0";
+          title.textContent = cluster.label || `Cluster #${cluster.cluster_id}`;
+          wrap.appendChild(title);
+
+          const sub = document.createElement("div");
+          sub.style.cssText = "font-size:0.8rem;color:var(--text-dim);margin-bottom:8px";
+          sub.textContent = `${members.length} items in this cluster`;
+          wrap.appendChild(sub);
+
+          const groupBtn = document.createElement("button");
+          groupBtn.className = "today-control-btn";
+          groupBtn.textContent = "Group these as a new item";
+          groupBtn.style.marginBottom = "12px";
+          groupBtn.addEventListener("click", () => groupCluster(cluster));
+          wrap.appendChild(groupBtn);
+
+          const membersWrap = document.createElement("div");
+          membersWrap.style.cssText = "display:flex;flex-direction:column;gap:4px";
+          for (const m of members) {
+            const card = document.createElement("div");
+            card.style.cssText = "padding:8px;border:1px solid var(--border);border-radius:6px;cursor:pointer;display:flex;gap:8px;align-items:center";
+            const projColor = (() => {
+              const proj = (projectsCache || []).find((p) => p.id === m.project_id);
+              const theme = proj && typeof THEME_COLORS !== "undefined" ? (THEME_COLORS[proj.theme] || THEME_COLORS.midnight) : null;
+              return theme ? theme.highlight : "var(--accent)";
+            })();
+            const dot = document.createElement("span");
+            dot.style.cssText = `width:8px;height:8px;border-radius:50%;background:${projColor};flex-shrink:0`;
+            card.appendChild(dot);
+            const keyEl = document.createElement("strong");
+            keyEl.textContent = m.key || (m.id || "").substring(0, 8);
+            keyEl.style.cssText = "font-size:0.78rem;min-width:80px";
+            card.appendChild(keyEl);
+            const titleEl = document.createElement("span");
+            titleEl.textContent = m.title || "(untitled)";
+            titleEl.style.cssText = "font-size:0.85rem;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+            card.appendChild(titleEl);
+            if (m.is_representative) {
+              const repBadge = document.createElement("span");
+              repBadge.textContent = "rep";
+              repBadge.style.cssText = "font-size:0.66rem;padding:1px 5px;border-radius:4px;background:var(--surface-alt);color:var(--text-dim)";
+              card.appendChild(repBadge);
+            }
+            card.addEventListener("click", () => {
+              if (m.project_id && m.project_id !== currentProjectId) switchProject(m.project_id);
+              openDetail(m.id);
+            });
+            membersWrap.appendChild(card);
+          }
+          wrap.appendChild(membersWrap);
+
+          listEl.innerHTML = "";
+          listEl.appendChild(wrap);
+        }
+
+        async function groupCluster(cluster) {
+          const members = cluster.members || [];
+          if (members.length === 0) { toast("Cluster is empty", "error"); return; }
+          const defaultTitle = cluster.label || `Group from cluster #${cluster.cluster_id}`;
+          const title = prompt("Title for the new group item:", defaultTitle);
+          if (!title || !title.trim()) return;
+          // Default to the representative member's project, falling back to the current project.
+          const rep = members.find((m) => m.is_representative) || members[0];
+          const targetProject = rep && rep.project_id ? rep.project_id : (currentProjectId || undefined);
+          try {
+            const result = await apiPost(`/items/group`, {
+              title: title.trim(),
+              child_item_ids: members.map((m) => m.id),
+              target_project_id: targetProject,
+              actor: "dashboard",
+            });
+            toast("Group created");
+            closeTopicsPanel();
+            refreshCurrentView && refreshCurrentView();
+            if (result && result.id) openDetail(result.id);
+          } catch (e) {
+            toast("Group failed: " + (e?.message || e), "error");
+          }
+        }
+
+        $("#topicsBtn").addEventListener("click", openTopicsPanel);
+        $("#topicsCloseBtn").addEventListener("click", closeTopicsPanel);
+        $("#topicsPanelOverlay").addEventListener("click", closeTopicsPanel);
+        $("#topicsRefreshBtn").addEventListener("click", loadTopics);
 
         // ── Auto Refresh ──
 
