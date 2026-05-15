@@ -2229,48 +2229,57 @@ Extract the structured fields from this description. Return ONLY valid JSON.`;
         const qs = queryParams(req.url || "");
         const threshold = qs.get("threshold") ? parseFloat(qs.get("threshold")!) : EMBEDDING_MERGE_THRESHOLD;
         const limit = qs.get("limit") ? parseInt(qs.get("limit")!, 10) : 50;
-        const pairs = getGlobalCandidatePairs({ threshold, limit });
-        // Hydrate both sides
+        // Over-fetch then filter, so the visible limit still lands after we drop done/cancelled pairs.
+        const pairs = getGlobalCandidatePairs({ threshold, limit: limit * 4 });
+        // Hydrate both sides. Skip pairs where either side is done or cancelled — they're not merge candidates.
         const hydrated = pairs
           .map((p) => {
             const a = getWorkItem(p.item_a);
             const b = getWorkItem(p.item_b);
             if (!a || !b) return null;
+            if (a.state === "done" || a.state === "cancelled") return null;
+            if (b.state === "done" || b.state === "cancelled") return null;
             return {
               a: { id: a.id, key: getWorkItemKey(a), title: a.title, state: a.state, project_id: a.project_id },
               b: { id: b.id, key: getWorkItemKey(b), title: b.title, state: b.state, project_id: b.project_id },
               similarity: p.similarity,
             };
           })
-          .filter((x): x is NonNullable<typeof x> => x !== null);
+          .filter((x): x is NonNullable<typeof x> => x !== null)
+          .slice(0, limit);
         return json(res, hydrated);
       }
 
       // GET /embeddings/topics — cluster assignments for the Topics view.
       if (parts.length === 2 && parts[1] === "topics" && method === "GET") {
         const clusters = listClusters();
-        const result = clusters.map((c) => {
-          const members = getClusterMembers(c.cluster_id)
-            .map((m) => {
-              const it = getWorkItem(m.item_id);
-              if (!it) return null;
-              return {
-                id: it.id,
-                key: getWorkItemKey(it),
-                title: it.title,
-                state: it.state,
-                project_id: it.project_id,
-                is_representative: !!m.is_representative,
-              };
-            })
-            .filter((x): x is NonNullable<typeof x> => x !== null);
-          return {
-            cluster_id: c.cluster_id,
-            label: c.label,
-            size: members.length,
-            members,
-          };
-        });
+        const result = clusters
+          .map((c) => {
+            const members = getClusterMembers(c.cluster_id)
+              .map((m) => {
+                const it = getWorkItem(m.item_id);
+                if (!it) return null;
+                // Hide done/cancelled members — TRACK-289 review feedback: topics should show live work only.
+                if (it.state === "done" || it.state === "cancelled") return null;
+                return {
+                  id: it.id,
+                  key: getWorkItemKey(it),
+                  title: it.title,
+                  state: it.state,
+                  project_id: it.project_id,
+                  is_representative: !!m.is_representative,
+                };
+              })
+              .filter((x): x is NonNullable<typeof x> => x !== null);
+            return {
+              cluster_id: c.cluster_id,
+              label: c.label,
+              size: members.length,
+              members,
+            };
+          })
+          // Drop clusters that became singletons (or empty) after filtering — matches the existing "singletons are dropped" rule.
+          .filter((c) => c.size >= 2);
         return json(res, result);
       }
 
