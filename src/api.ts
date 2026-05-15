@@ -110,6 +110,7 @@ import {
   listClusters,
   getClusterMembers,
   setClusterLabel,
+  getLinksAmongItems,
   upgradeLinkSource,
   getLink,
   createProposal,
@@ -2279,7 +2280,39 @@ Extract the structured fields from this description. Return ONLY valid JSON.`;
             };
           })
           // Drop clusters that became singletons (or empty) after filtering — matches the existing "singletons are dropped" rule.
-          .filter((c) => c.size >= 2);
+          .filter((c) => c.size >= 2)
+          // TRACK-289 review feedback: if all members of a cluster are already
+          // connected to each other via existing links (any relation), the
+          // cluster is redundant — they're already linked/grouped. Hide it.
+          // Test: union-find over the link edges restricted to cluster
+          // members; drop if the result is a single connected component.
+          .filter((c) => {
+            const ids = c.members.map((m) => m.id);
+            const edges = getLinksAmongItems(ids);
+            if (edges.length === 0) return true;
+            const parent = new Map<string, string>(ids.map((id) => [id, id]));
+            const find = (x: string): string => {
+              let r = x;
+              while (parent.get(r) !== r) r = parent.get(r)!;
+              // Path compression so repeated finds stay near-constant.
+              let cur = x;
+              while (parent.get(cur) !== r) {
+                const next = parent.get(cur)!;
+                parent.set(cur, r);
+                cur = next;
+              }
+              return r;
+            };
+            const union = (a: string, b: string) => {
+              const ra = find(a);
+              const rb = find(b);
+              if (ra !== rb) parent.set(ra, rb);
+            };
+            for (const e of edges) union(e.from_item_id, e.to_item_id);
+            const roots = new Set(ids.map((id) => find(id)));
+            // Single component covering every member → already linked/grouped.
+            return roots.size > 1;
+          });
         return json(res, result);
       }
 

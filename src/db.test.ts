@@ -32,6 +32,7 @@ import {
   removeLink,
   removeLinkById,
   listLinks,
+  getLinksAmongItems,
   extractMentionKeys,
   reconcileMentionLinks,
   VALID_LINK_RELATIONS,
@@ -2594,6 +2595,33 @@ describe('Links', () => {
       const fromA = listLinks(itemA);
       // 3 visible: A→B (duplicates), A↔C (relates_to), B→A (child_of inverse)
       expect(fromA).toHaveLength(3);
+    });
+  });
+
+  describe('getLinksAmongItems (TRACK-289)', () => {
+    it('returns empty for fewer than 2 ids', () => {
+      expect(getLinksAmongItems([])).toEqual([]);
+      expect(getLinksAmongItems([itemA])).toEqual([]);
+    });
+
+    it('returns only edges where both endpoints are in the set', () => {
+      const itemD = createWorkItem({ project_id: projectId, title: 'D' }).id;
+      addLink({ from_item_id: itemA, to_item_id: itemB, relation: 'relates_to', created_by: 'dashboard' });
+      addLink({ from_item_id: itemA, to_item_id: itemD, relation: 'duplicates', created_by: 'dashboard' });
+      const edges = getLinksAmongItems([itemA, itemB, itemC]);
+      expect(edges).toHaveLength(1);
+      expect(edges[0].from_item_id).toBe(itemA);
+      expect(edges[0].to_item_id).toBe(itemB);
+      expect(edges[0].relation).toBe('relates_to');
+    });
+
+    it('returns edges across all relations (not just relates_to)', () => {
+      addLink({ from_item_id: itemA, to_item_id: itemB, relation: 'parent_of', created_by: 'dashboard' });
+      addLink({ from_item_id: itemB, to_item_id: itemC, relation: 'duplicates', created_by: 'dashboard' });
+      const edges = getLinksAmongItems([itemA, itemB, itemC]);
+      expect(edges).toHaveLength(2);
+      const rels = edges.map((e) => e.relation).sort();
+      expect(rels).toEqual(['duplicates', 'parent_of']);
     });
   });
 

@@ -3358,6 +3358,27 @@ export function listLinksByRelation(
   return listLinks(workItemId, relation);
 }
 
+// TRACK-289: return raw link edges where BOTH endpoints lie inside the given
+// item set. Used by the Topics view to suppress clusters whose members are
+// already linked/grouped — there's no value in surfacing a topic when the
+// items are already related.
+export function getLinksAmongItems(
+  itemIds: string[],
+): Array<{ from_item_id: string; to_item_id: string; relation: string }> {
+  if (itemIds.length < 2) return [];
+  const placeholders = itemIds.map(() => "?").join(",");
+  return db
+    .prepare(
+      `SELECT from_item_id, to_item_id, relation FROM tracker_links
+       WHERE from_item_id IN (${placeholders}) AND to_item_id IN (${placeholders})`,
+    )
+    .all(...itemIds, ...itemIds) as Array<{
+    from_item_id: string;
+    to_item_id: string;
+    relation: string;
+  }>;
+}
+
 // ── Groups (TRACK-281) ──
 
 /**
