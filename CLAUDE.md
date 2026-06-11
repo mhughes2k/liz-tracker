@@ -1001,3 +1001,14 @@ Shared constants (defined near the top of the JS, line ~11209):
 | --- | --- |
 | `PRIORITY_ORDER` | Maps priority names to sort order (`{ urgent: 0, high: 1, ... }`) |
 | `SESSION_STATUS_MAP` | Maps session status strings to `{ emoji, tooltip }` for card badges |
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For architectural or cross-file questions ("how does X relate to Y", "what depends on Z", "what are the core abstractions"), run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output. For routine single-file or known-location work, grep/read directly — the graph adds no value there.
+- The graph's line numbers and semantic edges can drift as code changes — verify against current source before acting on graph output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
