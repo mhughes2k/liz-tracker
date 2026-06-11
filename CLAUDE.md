@@ -1011,4 +1011,4 @@ Rules:
 - The graph's line numbers and semantic edges can drift as code changes — verify against current source before acting on graph output.
 - If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
-- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
+- The graph auto-rebuilds after every commit and branch switch via `.githooks/post-commit` / `post-checkout` (AST-only, runs detached in the background, logs to `~/.cache/graphify-rebuild.log`). Run `graphify update .` manually only for uncommitted changes you want reflected immediately, or `/graphify --update` for an LLM re-pass after significant doc changes (CLAUDE.md, SPEC.md, README.md, docs/).
