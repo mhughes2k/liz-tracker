@@ -94,6 +94,7 @@ import {
   getRecentItems,
   getAttentionItems,
   getExecutionAudits,
+  countExecutionAuditsWithTranscript,
   getExecutionAudit,
   setAuditSessionTitle,
   createAttachment,
@@ -1835,6 +1836,7 @@ Extract the structured fields from this description. Return ONLY valid JSON.`;
           const blockers = getBlockers(itemId).map((d) => ({ ...d, key: getWorkItemKey(d) }));
           const blocked = blockers.length > 0;
           const attachments = listAttachments(itemId);
+          const session_count = countExecutionAuditsWithTranscript(itemId);
           return json(res, {
             ...item,
             key,
@@ -1847,6 +1849,7 @@ Extract the structured fields from this description. Return ONLY valid JSON.`;
             blockers,
             blocked,
             attachments,
+            session_count,
           });
         }
         if (method === "PATCH") {

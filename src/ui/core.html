@@ -10405,7 +10405,7 @@
       <div class="detail-tabs" id="detailTabs">
         <div class="detail-tab active" data-tab="settings">Settings</div>
         <div class="detail-tab" data-tab="comments">Comments<span class="detail-tab-badge" id="detailTabCommentCount" style="display:none"></span></div>
-        <div class="detail-tab" data-tab="sessions">Sessions<span class="detail-tab-agent" id="detailTabSessionAgent" style="display:none">🤖</span></div>
+        <div class="detail-tab" data-tab="sessions">Sessions<span class="detail-tab-badge" id="detailTabSessionCount" style="display:none"></span><span class="detail-tab-agent" id="detailTabSessionAgent" style="display:none">🤖</span></div>
         <div class="detail-tab" data-tab="activity">Activity</div>
       </div>
       <div class="detail-body">
@@ -16482,6 +16482,15 @@
             badge.style.display = "";
           } else {
             badge.style.display = "none";
+          }
+          // Past-sessions counter on the Sessions tab (mirrors the Comments badge)
+          const sessionBadge = $("#detailTabSessionCount");
+          const sessionCount = item.session_count || 0;
+          if (sessionCount > 0) {
+            sessionBadge.textContent = sessionCount;
+            sessionBadge.style.display = "";
+          } else {
+            sessionBadge.style.display = "none";
           }
           // Show robot emoji on Sessions tab when agent is actively running
           const agentBadge = $("#detailTabSessionAgent");

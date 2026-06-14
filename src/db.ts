@@ -4695,6 +4695,16 @@ export function getExecutionAudits(workItemId: string): ExecutionAudit[] {
     .all(workItemId) as ExecutionAudit[];
 }
 
+/** Count execution audits that have a transcript (i.e. real past sessions visible in the Sessions tab). */
+export function countExecutionAuditsWithTranscript(workItemId: string): number {
+  const row = db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM tracker_execution_audits WHERE work_item_id = ? AND transcript IS NOT NULL",
+    )
+    .get(workItemId) as { n: number };
+  return row?.n ?? 0;
+}
+
 /** Get a single execution audit by ID. */
 export function getExecutionAudit(auditId: string): ExecutionAudit | undefined {
   return db
