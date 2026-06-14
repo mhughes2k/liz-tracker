@@ -361,8 +361,10 @@ async function loadPresDeckThumbnails(slug, forceRefresh) {
     if (data.thumbnails && data.thumbnails.length > 0) {
       content.innerHTML = `<div class="pres-deck-thumbnails" id="presDeckThumbs"></div>`;
       const grid = $("#presDeckThumbs");
-      // Cache-bust browser image cache when force-refreshing
-      const cacheBustSuffix = forceRefresh ? `${Date.now()}` : "";
+      // Browser cache-bust: prefer deckwright's generatedAt (changes whenever
+      // the deck is rebuilt or shifted in place after a slide delete). Falls
+      // back to a per-fetch timestamp when force-refreshing without a value.
+      const cacheBustSuffix = data.generatedAt ? `${data.generatedAt}` : (forceRefresh ? `${Date.now()}` : "");
       data.thumbnails.forEach((thumbUrl, i) => {
         const div = document.createElement("div");
         div.className = "pres-deck-thumb";
@@ -420,10 +422,11 @@ function showPresDeleteConfirm(thumbDiv, index, slug) {
     try {
       await apiDelete(`/items/${spaceItemId}/presentation/deck-slide?index=${index}`);
       toast("Slide deleted", "success");
-      // Force-refresh thumbnails — deck.mdx mtime changed so DeckWright regenerates
+      // Server shifted thumbnail files in place (no Playwright regen). Reload
+      // normally — the deck's new generatedAt busts the browser image cache.
       const content = $("#presDeckContent");
       if (content) content.innerHTML = '<div class="pres-deck-loading">Refreshing thumbnails...</div>';
-      loadPresDeckThumbnails(slug, true);
+      loadPresDeckThumbnails(slug);
       // Invalidate the Slides tab so it re-fetches deck.mdx on next visit
       presSlidesMdxLoaded = false;
       const slidesPanel = $("#presTabSlides");

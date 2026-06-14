@@ -14,7 +14,7 @@
  * - Discussion sidebar (always visible)
  */
 
-import { readFileSync, existsSync, mkdirSync, writeFileSync, utimesSync } from "fs";
+import { readFileSync, existsSync, mkdirSync, writeFileSync, statSync, unlinkSync, renameSync } from "fs";
 import { join } from "path";
 import { updateWorkItem } from "../db.js";
 import { DECKWRIGHT_URL, STORE_DIR } from "../config.js";
@@ -23,6 +23,7 @@ import type { SpacePlugin, SpaceApiRoute, WorkItem } from "./types.js";
 // ── Filesystem Constants ──
 
 const DECKWRIGHT_DECKS_DIR = join(process.env.HOME || "", "deckwright", "src", "content", "decks");
+const DECKWRIGHT_THUMBS_DIR = join(process.env.HOME || "", "deckwright", "public", "thumbnails");
 const THUMB_CACHE_DIR = join(STORE_DIR, "deck-thumbs");
 
 // ── Data Layer ──
@@ -109,6 +110,112 @@ export function serializeSlideRaws(slides: SlideRaw[]): string {
   return slides
     .map((s) => (s.frontmatter ? `---\n${s.frontmatter}\n---\n\n${s.content}` : s.content))
     .join("\n\n---\n");
+}
+
+// ── Thumbnail Shift ──
+// DeckWright names thumbnails positionally (slide-001.png, slide-002.png, …) and
+// caches them in public/thumbnails/{slug}/ with a sidecar .meta.json keyed on
+// deck.mdx mtime. A naive slide delete bumps the mtime and forces DeckWright to
+// re-run Playwright across the entire deck. Instead we shift the existing files
+// in place and rewrite .meta.json so the cache validation still passes — only
+// the deleted slide's thumbnail is lost; the rest survive unchanged.
+
+interface DeckwrightThumbnailMeta {
+  mdxMtime: number;
+  thumbnails: string[];
+  generatedAt: number;
+}
+
+function thumbnailFilenameFromUrl(url: string): string {
+  return (url.split("?")[0] ?? "").split("/").pop() || "";
+}
+
+function slideThumbFilename(oneBasedIndex: number): string {
+  return `slide-${String(oneBasedIndex).padStart(3, "0")}.png`;
+}
+
+/**
+ * Shift thumbnail files after deleting the slide at `deletedIndex`.
+ *
+ * Returns true on success (caller should NOT touch mdx mtime — cache is now
+ * coherent with the new mdx). Returns false when the deckwright cache is
+ * missing/stale/mismatched — caller should fall back to invalidating the cache
+ * by touching mdx mtime so DeckWright re-runs Playwright.
+ *
+ * Exported for unit testing.
+ */
+export function shiftThumbnailsAfterSlideDelete(opts: {
+  deckThumbDir: string;     // DeckWright's public/thumbnails/{slug}
+  localThumbDir: string;    // Tracker's STORE_DIR/deck-thumbs/{slug}
+  deletedIndex: number;     // 0-based position of the removed slide
+  oldSlideCount: number;    // Slide count BEFORE the delete
+  newMdxMtimeMs: number;    // mtime of deck.mdx AFTER the write
+}): boolean {
+  const { deckThumbDir, localThumbDir, deletedIndex, oldSlideCount, newMdxMtimeMs } = opts;
+  const metaFile = join(deckThumbDir, ".meta.json");
+  if (!existsSync(metaFile)) return false;
+
+  let meta: DeckwrightThumbnailMeta;
+  try {
+    const parsed = JSON.parse(readFileSync(metaFile, "utf-8")) as DeckwrightThumbnailMeta;
+    if (!Array.isArray(parsed.thumbnails)) return false;
+    meta = parsed;
+  } catch {
+    return false;
+  }
+
+  if (meta.thumbnails.length !== oldSlideCount) return false;
+  if (deletedIndex < 0 || deletedIndex >= oldSlideCount) return false;
+
+  const filenames = meta.thumbnails.map(thumbnailFilenameFromUrl);
+  const newSlideCount = oldSlideCount - 1;
+
+  // 1. Drop the deleted slide's thumbnail in both caches.
+  const deletedFilename = filenames[deletedIndex];
+  if (deletedFilename) {
+    try { unlinkSync(join(deckThumbDir, deletedFilename)); } catch { /* may not exist */ }
+    try { unlinkSync(join(localThumbDir, deletedFilename)); } catch { /* may not exist */ }
+  }
+
+  // 2. Rename successor thumbnails low → high so we never clobber an upcoming source.
+  //    The file at OLD position (newPos + 1) becomes the file at NEW position newPos.
+  const slugBase = deckThumbDir.split("/").pop() || "";
+  const newThumbnails: string[] = [];
+  for (let newPos = 0; newPos < newSlideCount; newPos++) {
+    const targetFilename = slideThumbFilename(newPos + 1);
+    newThumbnails.push(`/thumbnails/${slugBase}/${targetFilename}`);
+
+    if (newPos < deletedIndex) continue; // file kept its name
+
+    const sourceFilename = filenames[newPos + 1];
+    if (!sourceFilename || sourceFilename === targetFilename) continue;
+
+    const fromDeckwright = join(deckThumbDir, sourceFilename);
+    const toDeckwright = join(deckThumbDir, targetFilename);
+    if (existsSync(fromDeckwright)) {
+      try { renameSync(fromDeckwright, toDeckwright); } catch { return false; }
+    }
+
+    const fromLocal = join(localThumbDir, sourceFilename);
+    const toLocal = join(localThumbDir, targetFilename);
+    if (existsSync(fromLocal)) {
+      try { renameSync(fromLocal, toLocal); } catch { /* local cache is rebuildable */ }
+    }
+  }
+
+  // 3. Rewrite .meta.json so DeckWright's cache check passes against the new mdx mtime.
+  try {
+    const newMeta: DeckwrightThumbnailMeta = {
+      mdxMtime: newMdxMtimeMs,
+      thumbnails: newThumbnails,
+      generatedAt: Date.now(),
+    };
+    writeFileSync(metaFile, JSON.stringify(newMeta));
+  } catch {
+    return false;
+  }
+
+  return true;
 }
 
 // ── HTTP Helpers ──
@@ -279,19 +386,34 @@ const presentationApiRoutes: SpaceApiRoute[] = [
         return errorResponse(res, "Cannot delete the last remaining slide", 400);
       }
 
+      const oldSlideCount = slides.length;
       slides.splice(index, 1);
       const newContent = serializeSlideRaws(slides);
       try {
         writeFileSync(filepath, newContent, "utf-8");
-        // Touch mtime so DeckWright's thumbnail cache invalidates on next fetch
-        const now = new Date();
-        utimesSync(filepath, now, now);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         return errorResponse(res, `Failed to write deck.mdx: ${msg}`, 500);
       }
 
-      jsonResponse(res, { ok: true, remaining: slides.length, deleted_index: index });
+      // Try to shift thumbnails in place so DeckWright doesn't re-run Playwright
+      // across the whole deck for the sake of one deleted slide. If the cache is
+      // missing or out of sync, fall back to letting DeckWright regenerate.
+      let shifted = false;
+      try {
+        const newMtimeMs = statSync(filepath).mtimeMs;
+        shifted = shiftThumbnailsAfterSlideDelete({
+          deckThumbDir: join(DECKWRIGHT_THUMBS_DIR, spaceData.deck_slug),
+          localThumbDir: join(THUMB_CACHE_DIR, spaceData.deck_slug),
+          deletedIndex: index,
+          oldSlideCount,
+          newMdxMtimeMs: newMtimeMs,
+        });
+      } catch {
+        shifted = false;
+      }
+
+      jsonResponse(res, { ok: true, remaining: slides.length, deleted_index: index, thumbnails_shifted: shifted });
     },
   },
   // GET /items/:id/presentation/deck-thumb — serve a cached thumbnail image
