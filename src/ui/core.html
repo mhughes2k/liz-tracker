@@ -11646,8 +11646,9 @@
           const existing = _sessionViewerSources.get(item.id);
           if (existing) { existing.close(); _sessionViewerSources.delete(item.id); }
 
+          // No active session — fall back to past session transcripts (if any)
           if (!item.session_id || !item.session_status) {
-            container.innerHTML = '';
+            _renderTranscriptViewer(container, item);
             return null;
           }
 
@@ -12318,7 +12319,7 @@
             <div class="session-viewer" style="border:1px solid var(--border); border-radius:var(--radius); margin:12px 0; overflow:hidden; display:flex; flex-direction:column; flex:1; min-height:0;">
               <div style="padding:8px 12px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; background:var(--bg-card); flex-shrink:0;">
                 <span style="font-weight:600; font-size:13px;">Agent Session Transcript</span>
-                <span style="font-size:12px;">${(() => { const s = SESSION_STATUS_MAP[item.session_status] || { emoji: "\u2753", tooltip: item.session_status }; return `<span title="${esc(s.tooltip)}">${s.emoji}</span>`; })()}</span>
+                <span style="font-size:12px;">${item.session_status ? (() => { const s = SESSION_STATUS_MAP[item.session_status] || { emoji: "\u2753", tooltip: item.session_status }; return `<span title="${esc(s.tooltip)}">${s.emoji}</span>`; })() : ''}</span>
               </div>
               <div class="sv-events" style="flex:1; overflow-y:auto; padding:8px 12px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; line-height:1.7; background:var(--bg);">
                 <div style="color:var(--text-muted); font-style:italic;">Loading transcript\u2026</div>
@@ -12334,7 +12335,7 @@
             // Filter audits that have transcripts, oldest first for display
             const withTranscripts = audits.filter(a => a.transcript).reverse();
             if (withTranscripts.length === 0) {
-              eventsEl.innerHTML = '<div style="color:var(--text-muted); font-style:italic;">No transcript available for this session.</div>';
+              eventsEl.innerHTML = '<div style="color:var(--text-muted); font-style:italic;">No past sessions for this item.</div>';
               return;
             }
             // Single session — show as before
