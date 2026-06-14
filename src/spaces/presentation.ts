@@ -14,7 +14,7 @@
  * - Discussion sidebar (always visible)
  */
 
-import { readFileSync, existsSync, mkdirSync, writeFileSync } from "fs";
+import { readFileSync, existsSync, mkdirSync, writeFileSync, utimesSync } from "fs";
 import { join } from "path";
 import { updateWorkItem } from "../db.js";
 import { DECKWRIGHT_URL, STORE_DIR } from "../config.js";
@@ -57,6 +57,58 @@ function sanitizePresentationSpaceData(raw: string): string {
   } catch {
     return raw;
   }
+}
+
+// ── Slide Parser ──
+// Minimal raw-text parser mirroring DeckWright's parseSlides/serializeSlides
+// (deckwright/src/lib/slide-parser.ts) without depending on gray-matter/js-yaml.
+// We preserve frontmatter as raw text so round-tripping is lossless.
+
+export interface SlideRaw {
+  frontmatter: string; // raw YAML text without --- markers
+  content: string;     // raw markdown content
+}
+
+function looksLikeYaml(text: string): boolean {
+  const lines = text.trim().split("\n");
+  if (lines.length === 0) return false;
+  const yamlLines = lines.filter((l) => /^\w[\w\s]*:/.test(l.trim()));
+  return yamlLines.length > 0 && yamlLines.length >= lines.length * 0.5;
+}
+
+export function parseSlideRaws(raw: string): SlideRaw[] {
+  const text = raw.replace(/\r\n/g, "\n").trim();
+  if (!text) return [];
+  const parts = text.split(/\n---\n/);
+  const slides: SlideRaw[] = [];
+  let i = 0;
+
+  while (i < parts.length) {
+    const part = parts[i];
+    const trimmed = part.trim();
+
+    if (trimmed.startsWith("---")) {
+      // Frontmatter block; content lives in next part
+      const fm = trimmed.replace(/^---\n?/, "").replace(/\n?---$/, "").trim();
+      const content = i + 1 < parts.length ? parts[i + 1].trim() : "";
+      slides.push({ frontmatter: fm, content });
+      i += 2;
+    } else if (i + 1 < parts.length && looksLikeYaml(trimmed)) {
+      slides.push({ frontmatter: trimmed, content: parts[i + 1].trim() });
+      i += 2;
+    } else {
+      slides.push({ frontmatter: "", content: trimmed });
+      i += 1;
+    }
+  }
+
+  return slides;
+}
+
+export function serializeSlideRaws(slides: SlideRaw[]): string {
+  return slides
+    .map((s) => (s.frontmatter ? `---\n${s.frontmatter}\n---\n\n${s.content}` : s.content))
+    .join("\n\n---\n");
 }
 
 // ── HTTP Helpers ──
@@ -192,6 +244,54 @@ const presentationApiRoutes: SpaceApiRoute[] = [
         const msg = e instanceof Error ? e.message : String(e);
         errorResponse(res, `Failed to reach DeckWright: ${msg}`, 502);
       }
+    },
+  },
+  // DELETE /items/:id/presentation/deck-slide?index=N — remove slide N from deck.mdx
+  {
+    method: "DELETE",
+    path: "deck-slide",
+    handler: async (req, res, item) => {
+      const spaceData = parsePresentationSpaceData(item.space_data);
+      if (!spaceData.deck_slug) {
+        return errorResponse(res, "No deck configured", 400);
+      }
+
+      const reqUrl = new URL(req.url || "", "http://localhost");
+      const indexStr = reqUrl.searchParams.get("index");
+      const index = indexStr === null ? NaN : parseInt(indexStr, 10);
+      if (!Number.isFinite(index) || index < 0) {
+        return errorResponse(res, "Invalid index parameter", 400);
+      }
+
+      const filepath = join(DECKWRIGHT_DECKS_DIR, spaceData.deck_slug, "deck.mdx");
+      let raw: string;
+      try {
+        raw = readFileSync(filepath, "utf-8");
+      } catch {
+        return errorResponse(res, `deck.mdx not found for ${spaceData.deck_slug}`, 404);
+      }
+
+      const slides = parseSlideRaws(raw);
+      if (index >= slides.length) {
+        return errorResponse(res, `Slide index ${index} out of range (deck has ${slides.length} slides)`, 400);
+      }
+      if (slides.length <= 1) {
+        return errorResponse(res, "Cannot delete the last remaining slide", 400);
+      }
+
+      slides.splice(index, 1);
+      const newContent = serializeSlideRaws(slides);
+      try {
+        writeFileSync(filepath, newContent, "utf-8");
+        // Touch mtime so DeckWright's thumbnail cache invalidates on next fetch
+        const now = new Date();
+        utimesSync(filepath, now, now);
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return errorResponse(res, `Failed to write deck.mdx: ${msg}`, 500);
+      }
+
+      jsonResponse(res, { ok: true, remaining: slides.length, deleted_index: index });
     },
   },
   // GET /items/:id/presentation/deck-thumb — serve a cached thumbnail image

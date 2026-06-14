@@ -8409,6 +8409,7 @@
         gap: 12px;
       }
       .pres-deck-thumb {
+        position: relative;
         border-radius: var(--radius);
         border: 1px solid var(--border);
         overflow: hidden;
@@ -8418,6 +8419,83 @@
       }
       .pres-deck-thumb:hover {
         border-color: var(--highlight);
+      }
+      .pres-deck-thumb-delete {
+        position: absolute;
+        top: 6px;
+        right: 6px;
+        width: 22px;
+        height: 22px;
+        border-radius: 50%;
+        border: 1px solid rgba(255, 255, 255, 0.25);
+        background: rgba(20, 24, 40, 0.85);
+        color: #fff;
+        font-size: 16px;
+        line-height: 1;
+        cursor: pointer;
+        opacity: 0;
+        transition: opacity 0.15s, background 0.15s, transform 0.15s;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        z-index: 2;
+      }
+      .pres-deck-thumb:hover .pres-deck-thumb-delete,
+      .pres-deck-thumb-delete:focus {
+        opacity: 1;
+      }
+      .pres-deck-thumb-delete:hover {
+        background: rgba(220, 53, 69, 0.95);
+        transform: scale(1.08);
+      }
+      .pres-deck-thumb-confirm {
+        position: absolute;
+        inset: 0;
+        background: rgba(8, 12, 24, 0.92);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        z-index: 3;
+        text-align: center;
+        padding: 12px;
+        cursor: default;
+      }
+      .pres-deck-thumb-confirm-text {
+        color: #fff;
+        font-size: 0.85rem;
+        font-weight: 500;
+      }
+      .pres-deck-thumb-confirm-actions {
+        display: flex;
+        gap: 8px;
+      }
+      .pres-deck-thumb-confirm-btn {
+        padding: 4px 12px;
+        border-radius: var(--radius);
+        border: 1px solid var(--border);
+        background: var(--surface, rgba(255, 255, 255, 0.08));
+        color: var(--text);
+        font-size: 0.8rem;
+        cursor: pointer;
+        font-family: inherit;
+      }
+      .pres-deck-thumb-confirm-btn:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+      .pres-deck-thumb-confirm-delete {
+        background: #dc3545;
+        border-color: #dc3545;
+        color: #fff;
+      }
+      .pres-deck-thumb-confirm-delete:hover:not(:disabled) {
+        background: #c12d3d;
+      }
+      .pres-deck-thumb-confirm-cancel:hover {
+        background: rgba(255, 255, 255, 0.12);
       }
       .pres-deck-thumb img {
         width: 100%;

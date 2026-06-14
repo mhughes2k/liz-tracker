@@ -91,6 +91,7 @@ npm run test:coverage # Run tests with coverage report
 - `src/runner-output.test.ts` — runner output helpers (truncateOutput, summarizeArgs, computeUnifiedDiff)
 - `src/spaces/travel.test.ts` — type-aware segment deduplication key logic (flight/lodging/transport disambiguation)
 - `src/spaces/scheduled.test.ts` — scheduled space data sanitization (malformed `days_of_week` normalization, numeric-to-name coercion, invalid entry dropping)
+- `src/spaces/presentation.test.ts` — DeckWright slide parser/serializer round-trip + middle/first/last slide deletion + CRLF handling
 
 **To activate the pre-push hook** (run once per clone):
 ```bash
@@ -745,6 +746,7 @@ tracker_add_travel_segment({
 - `GET /items/:id/presentation/deck-mdx` — read deck.mdx content from DeckWright content directory
 - `GET /items/:id/presentation/deck-thumbnails` — fetch thumbnail list from DeckWright, cache locally, return tracker-proxied URLs (pass `?refresh=1` to bust cache)
 - `GET /items/:id/presentation/deck-thumb?file=...` — serve a cached deck thumbnail image (no auth required)
+- `DELETE /items/:id/presentation/deck-slide?index=N` — remove slide N from deck.mdx (touches mtime so DeckWright regenerates thumbnails; refuses to delete the last remaining slide)
 - `POST /comments/:id/reactions` — toggle an emoji reaction on a comment (`{ emoji, author? }`)
 - `GET /comments/:id/reactions` — get aggregated reactions for a comment
 

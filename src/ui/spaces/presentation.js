@@ -370,11 +370,18 @@ async function loadPresDeckThumbnails(slug, forceRefresh) {
         // Thumbnail URLs are tracker-local (served through the tracker proxy)
         const imgSrc = cacheBustSuffix ? thumbUrl + (thumbUrl.includes("?") ? "&" : "?") + "t=" + cacheBustSuffix : thumbUrl;
         div.innerHTML = `
+          <button class="pres-deck-thumb-delete" type="button" title="Delete slide ${i + 1}" aria-label="Delete slide ${i + 1}">&times;</button>
           <img src="${esc(imgSrc)}" alt="Slide ${i + 1}" loading="lazy">
           <div class="pres-deck-thumb-label">Slide ${i + 1}</div>
         `;
-        div.addEventListener("click", () => {
+        div.addEventListener("click", (e) => {
+          if (e.target.closest(".pres-deck-thumb-delete") || e.target.closest(".pres-deck-thumb-confirm")) return;
           window.open(`${deckUrl}/${slug}/#${i + 1}`, "_blank");
+        });
+        const delBtn = div.querySelector(".pres-deck-thumb-delete");
+        delBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          showPresDeleteConfirm(div, i, slug);
         });
         grid.appendChild(div);
       });
@@ -384,6 +391,53 @@ async function loadPresDeckThumbnails(slug, forceRefresh) {
   } catch (e) {
     content.innerHTML = `<div class="pres-deck-loading">Failed to load thumbnails: ${esc(e.message || String(e))}</div>`;
   }
+}
+
+// ── Slide Delete (inline confirm overlay on thumbnail) ──
+function showPresDeleteConfirm(thumbDiv, index, slug) {
+  if (thumbDiv.querySelector(".pres-deck-thumb-confirm")) return;
+  const overlay = document.createElement("div");
+  overlay.className = "pres-deck-thumb-confirm";
+  overlay.innerHTML = `
+    <div class="pres-deck-thumb-confirm-text">Delete slide ${index + 1}?</div>
+    <div class="pres-deck-thumb-confirm-actions">
+      <button class="pres-deck-thumb-confirm-btn pres-deck-thumb-confirm-delete" type="button">Delete</button>
+      <button class="pres-deck-thumb-confirm-btn pres-deck-thumb-confirm-cancel" type="button">Cancel</button>
+    </div>
+  `;
+  thumbDiv.appendChild(overlay);
+
+  overlay.querySelector(".pres-deck-thumb-confirm-cancel").addEventListener("click", (e) => {
+    e.stopPropagation();
+    overlay.remove();
+  });
+
+  overlay.querySelector(".pres-deck-thumb-confirm-delete").addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.textContent = "Deleting...";
+    try {
+      await apiDelete(`/items/${spaceItemId}/presentation/deck-slide?index=${index}`);
+      toast("Slide deleted", "success");
+      // Force-refresh thumbnails — deck.mdx mtime changed so DeckWright regenerates
+      const content = $("#presDeckContent");
+      if (content) content.innerHTML = '<div class="pres-deck-loading">Refreshing thumbnails...</div>';
+      loadPresDeckThumbnails(slug, true);
+      // Invalidate the Slides tab so it re-fetches deck.mdx on next visit
+      presSlidesMdxLoaded = false;
+      const slidesPanel = $("#presTabSlides");
+      if (slidesPanel && slidesPanel.classList.contains("active")) {
+        const mdxEl = $("#presMdxContent");
+        if (mdxEl) mdxEl.innerHTML = '<div class="pres-mdx-empty">Reloading deck source...</div>';
+        loadPresMdx();
+      }
+    } catch (err) {
+      toast("Failed to delete slide: " + (err.message || err), "error");
+      btn.disabled = false;
+      btn.textContent = "Delete";
+    }
+  });
 }
 
 // ── Deck Config ──
