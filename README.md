@@ -311,6 +311,7 @@ Write endpoints require `Authorization: Bearer <token>`. Read endpoints are unau
 | `GET` | `/api/v1/items/:id/presentation/deck-mdx` | Read deck MDX from DeckWright |
 | `GET` | `/api/v1/items/:id/presentation/deck-thumbnails` | Fetch slide thumbnails (cached proxy, `?refresh=1` to bust cache) |
 | `GET` | `/api/v1/items/:id/presentation/deck-thumb` | Serve a cached slide thumbnail image |
+| `DELETE` | `/api/v1/items/:id/presentation/deck-slide?index=N` | Remove slide N from deck.mdx (shifts thumbnails in place; refuses to delete the last slide) |
 
 ### Activity Log
 
