@@ -112,6 +112,22 @@ export function serializeSlideRaws(slides: SlideRaw[]): string {
     .join("\n\n---\n");
 }
 
+/**
+ * Pull the first heading or first non-empty line from a slide's content,
+ * stripped of markdown markers, for use as a human-readable label (e.g. in the
+ * delete-confirm dialog). Returns an empty string when nothing usable is found.
+ */
+export function extractSlideHeading(content: string): string {
+  const lines = content.split("\n");
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith("#")) return line.replace(/^#+\s*/, "").trim();
+    return line.replace(/^[*_`]+|[*_`]+$/g, "").trim();
+  }
+  return "";
+}
+
 // ── Thumbnail Shift ──
 // DeckWright names thumbnails positionally (slide-001.png, slide-002.png, …) and
 // caches them in public/thumbnails/{slug}/ with a sidecar .meta.json keyed on
@@ -345,6 +361,18 @@ const presentationApiRoutes: SpaceApiRoute[] = [
 
         // Include deck_url so UI can build external links (overview, presenter, open deck)
         data.deck_url = DECKWRIGHT_URL;
+
+        // Attach per-slide headings parsed straight from deck.mdx so the UI
+        // can surface "Delete slide N: <heading>" in the delete confirmation.
+        // Aligns positionally with `data.thumbnails`. Best-effort: a missing
+        // or unparseable deck just yields an empty array.
+        try {
+          const mdxPath = join(DECKWRIGHT_DECKS_DIR, spaceData.deck_slug, "deck.mdx");
+          const mdxRaw = readFileSync(mdxPath, "utf-8");
+          data.slide_titles = parseSlideRaws(mdxRaw).map((s) => extractSlideHeading(s.content));
+        } catch {
+          data.slide_titles = [];
+        }
 
         jsonResponse(res, data);
       } catch (e: unknown) {

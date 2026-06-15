@@ -365,16 +365,19 @@ async function loadPresDeckThumbnails(slug, forceRefresh) {
       // the deck is rebuilt or shifted in place after a slide delete). Falls
       // back to a per-fetch timestamp when force-refreshing without a value.
       const cacheBustSuffix = data.generatedAt ? `${data.generatedAt}` : (forceRefresh ? `${Date.now()}` : "");
+      const slideTitles = Array.isArray(data.slide_titles) ? data.slide_titles : [];
       data.thumbnails.forEach((thumbUrl, i) => {
         const div = document.createElement("div");
         div.className = "pres-deck-thumb";
-        div.title = `Slide ${i + 1} — click to open at this slide`;
+        const heading = (slideTitles[i] || "").toString().trim();
+        const labelText = heading ? `Slide ${i + 1}: ${heading}` : `Slide ${i + 1}`;
+        div.title = `${labelText} — click to open at this slide`;
         // Thumbnail URLs are tracker-local (served through the tracker proxy)
         const imgSrc = cacheBustSuffix ? thumbUrl + (thumbUrl.includes("?") ? "&" : "?") + "t=" + cacheBustSuffix : thumbUrl;
         div.innerHTML = `
-          <button class="pres-deck-thumb-delete" type="button" title="Delete slide ${i + 1}" aria-label="Delete slide ${i + 1}">&times;</button>
-          <img src="${esc(imgSrc)}" alt="Slide ${i + 1}" loading="lazy">
-          <div class="pres-deck-thumb-label">Slide ${i + 1}</div>
+          <button class="pres-deck-thumb-delete" type="button" title="Delete ${esc(labelText)}" aria-label="Delete ${esc(labelText)}">&times;</button>
+          <img src="${esc(imgSrc)}" alt="${esc(labelText)}" loading="lazy">
+          <div class="pres-deck-thumb-label">${esc(labelText)}</div>
         `;
         div.addEventListener("click", (e) => {
           if (e.target.closest(".pres-deck-thumb-delete") || e.target.closest(".pres-deck-thumb-confirm")) return;
@@ -383,7 +386,7 @@ async function loadPresDeckThumbnails(slug, forceRefresh) {
         const delBtn = div.querySelector(".pres-deck-thumb-delete");
         delBtn.addEventListener("click", (e) => {
           e.stopPropagation();
-          showPresDeleteConfirm(div, i, slug);
+          showPresDeleteConfirm(div, i, slug, heading);
         });
         grid.appendChild(div);
       });
@@ -396,12 +399,16 @@ async function loadPresDeckThumbnails(slug, forceRefresh) {
 }
 
 // ── Slide Delete (inline confirm overlay on thumbnail) ──
-function showPresDeleteConfirm(thumbDiv, index, slug) {
+function showPresDeleteConfirm(thumbDiv, index, slug, heading) {
   if (thumbDiv.querySelector(".pres-deck-thumb-confirm")) return;
   const overlay = document.createElement("div");
   overlay.className = "pres-deck-thumb-confirm";
+  const headingHtml = heading
+    ? `<div class="pres-deck-thumb-confirm-heading">${esc(heading)}</div>`
+    : "";
   overlay.innerHTML = `
     <div class="pres-deck-thumb-confirm-text">Delete slide ${index + 1}?</div>
+    ${headingHtml}
     <div class="pres-deck-thumb-confirm-actions">
       <button class="pres-deck-thumb-confirm-btn pres-deck-thumb-confirm-delete" type="button">Delete</button>
       <button class="pres-deck-thumb-confirm-btn pres-deck-thumb-confirm-cancel" type="button">Cancel</button>

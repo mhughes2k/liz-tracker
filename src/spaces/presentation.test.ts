@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, mkdtempSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { parseSlideRaws, serializeSlideRaws, shiftThumbnailsAfterSlideDelete } from "./presentation.js";
+import { parseSlideRaws, serializeSlideRaws, shiftThumbnailsAfterSlideDelete, extractSlideHeading } from "./presentation.js";
 
 const SAMPLE = `---
 layout: TitleSlide
@@ -95,6 +95,115 @@ describe("parseSlideRaws / serializeSlideRaws", () => {
   it("normalises CRLF line endings", () => {
     const crlf = SAMPLE.replace(/\n/g, "\r\n");
     expect(parseSlideRaws(crlf)).toHaveLength(3);
+  });
+});
+
+// Regression guard against any off-by-one in the parse → splice → serialize →
+// re-parse chain. Uses a 5-slide deck shaped like the user's real "liz-tracker
+// update" deck so the test covers a realistic structure (TitleSlide + several
+// ContentSlides, some with notes). For every deletable index we assert the
+// EXACT surviving headings in order — not just the count — so any future
+// regression that mis-pairs frontmatter/content blocks would fail loudly.
+describe("parseSlideRaws / serializeSlideRaws — 5-slide content-exact deletion", () => {
+  const FIVE = `---
+layout: TitleSlide
+---
+
+# Deck Title
+
+Subtitle line
+
+---
+---
+layout: ContentSlide
+notes: First content slide.
+---
+
+## Slide Two Heading
+
+- bullet a
+
+---
+---
+layout: ContentSlide
+---
+
+## Slide Three Heading
+
+- bullet b
+
+---
+---
+layout: ContentSlide
+notes: Fourth slide notes.
+---
+
+## Slide Four Heading
+
+- bullet c
+
+---
+---
+layout: ContentSlide
+---
+
+## Slide Five Heading
+
+- bullet d`;
+
+  const ALL_HEADINGS = [
+    "# Deck Title",
+    "## Slide Two Heading",
+    "## Slide Three Heading",
+    "## Slide Four Heading",
+    "## Slide Five Heading",
+  ];
+
+  function headingsAfterDelete(deletedIndex: number): string[] {
+    const slides = parseSlideRaws(FIVE);
+    expect(slides).toHaveLength(5);
+    slides.splice(deletedIndex, 1);
+    const reparsed = parseSlideRaws(serializeSlideRaws(slides));
+    return reparsed.map((s) => {
+      const heading = s.content.split("\n").find((l) => l.startsWith("#"));
+      return heading ?? "(no heading)";
+    });
+  }
+
+  for (let deletedIndex = 0; deletedIndex < 5; deletedIndex++) {
+    it(`deleting index=${deletedIndex} preserves exact headings of surviving slides`, () => {
+      const expected = ALL_HEADINGS.filter((_, i) => i !== deletedIndex);
+      expect(headingsAfterDelete(deletedIndex)).toEqual(expected);
+    });
+  }
+
+  it("deleting a middle slide drops its frontmatter notes too", () => {
+    // The deleted slide has `notes: First content slide.` — that string must
+    // not leak into any surviving slide's frontmatter or content.
+    const slides = parseSlideRaws(FIVE);
+    slides.splice(1, 1);
+    const out = serializeSlideRaws(slides);
+    expect(out).not.toContain("First content slide");
+    expect(out).not.toContain("Slide Two Heading");
+    expect(out).not.toContain("bullet a");
+  });
+});
+
+describe("extractSlideHeading", () => {
+  it("returns the first heading stripped of markdown markers", () => {
+    expect(extractSlideHeading("# Title\n\nbody")).toBe("Title");
+    expect(extractSlideHeading("\n## Slide Two Heading\n- bullet")).toBe("Slide Two Heading");
+    expect(extractSlideHeading("### Deep heading")).toBe("Deep heading");
+  });
+
+  it("falls back to the first non-empty line when there is no heading", () => {
+    expect(extractSlideHeading("Just a paragraph\nsecond line")).toBe("Just a paragraph");
+    expect(extractSlideHeading("\n\n**bold intro**\nrest")).toBe("bold intro");
+  });
+
+  it("returns empty string for blank content", () => {
+    expect(extractSlideHeading("")).toBe("");
+    expect(extractSlideHeading("   \n\n  ")).toBe("");
   });
 });
 
