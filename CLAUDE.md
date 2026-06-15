@@ -58,7 +58,7 @@ Standalone project management tracker with kanban UI, REST API, MCP tools, and O
 | `src/ui/spaces/engagement.js` | Engagement UI renderer (~683 lines) |
 | `src/ui/spaces/scheduled.js` | Scheduled UI renderer (~908 lines) |
 | `src/ui/spaces/travel.js` | Travel UI renderer — day-by-day timeline, gap detection, segment cards (~1081 lines) |
-| `src/ui/spaces/presentation.js` | Presentation UI renderer — 3 tabs (Description, Slides, Deck) + discussion sidebar + DeckWright thumbnails (~650 lines) |
+| `src/ui/spaces/presentation.js` | Presentation UI renderer — 3 tabs (Description, Slides, Deck) + discussion sidebar + DeckWright thumbnails (~746 lines) |
 | `scripts/build-ui.js` | UI pre-compilation script (~60 lines, zero dependencies) |
 
 ## Development
@@ -983,7 +983,7 @@ When adding new features, always add a section header. Use grep for `// ──` 
 
 ### Shared Helpers & Constants
 
-Reusable utilities are in the **"Shared Helpers"** section (line ~12566). Check here before writing new utility code:
+Reusable utilities are in the **"Shared Helpers"** section (line ~12614). Check here before writing new utility code:
 
 | Helper | Purpose |
 | --- | --- |
@@ -998,7 +998,7 @@ Reusable utilities are in the **"Shared Helpers"** section (line ~12566). Check 
 | `buildOpencodeUrl(sessionId, dir)` | Build OpenCode deep link URL |
 | `base64UrlEncode(str)` | Encode string to base64url (for OpenCode directory paths) |
 
-Shared constants (defined near the top of the JS, line ~11287):
+Shared constants (defined near the top of the JS, line ~11335):
 
 | Constant | Purpose |
 | --- | --- |

@@ -312,6 +312,7 @@ Write endpoints require `Authorization: Bearer <token>`. Read endpoints are unau
 | `GET` | `/api/v1/items/:id/presentation/deck-thumbnails` | Fetch slide thumbnails (cached proxy, `?refresh=1` to bust cache) |
 | `GET` | `/api/v1/items/:id/presentation/deck-thumb` | Serve a cached slide thumbnail image |
 | `DELETE` | `/api/v1/items/:id/presentation/deck-slide?index=N` | Remove slide N from deck.mdx (shifts thumbnails in place; refuses to delete the last slide) |
+| `POST` | `/api/v1/items/:id/presentation/deck-reorder` | Reorder slides in deck.mdx (drag-to-reorder from the Deck tab) |
 
 ### Activity Log
 
