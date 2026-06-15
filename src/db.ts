@@ -1119,7 +1119,9 @@ export function _initTestTrackerDatabase(): void {
     }
   }
 
-  // Create execution audits table
+  // Create execution audits table. transcript/session_title mirror the
+  // ALTER TABLE migrations in initTrackerDatabase() so the in-memory schema
+  // matches production (TRACK-291: getSessionCountsBatch queries transcript).
   db.exec(`
     CREATE TABLE IF NOT EXISTS tracker_execution_audits (
       id TEXT PRIMARY KEY,
@@ -1134,6 +1136,8 @@ export function _initTestTrackerDatabase(): void {
       git_branch TEXT,
       git_diff_stats TEXT,
       created_at TEXT NOT NULL,
+      transcript TEXT DEFAULT NULL,
+      session_title TEXT DEFAULT NULL,
       FOREIGN KEY (work_item_id) REFERENCES tracker_work_items(id)
     );
   `);
@@ -4703,6 +4707,29 @@ export function countExecutionAuditsWithTranscript(workItemId: string): number {
     )
     .get(workItemId) as { n: number };
   return row?.n ?? 0;
+}
+
+/**
+ * Batch version of countExecutionAuditsWithTranscript — returns a map from
+ * work_item_id to the number of audits that have a transcript. Used by the
+ * project tracker view so kanban cards can show a "past sessions" badge
+ * without one query per card.
+ */
+export function getSessionCountsBatch(
+  workItemIds: string[],
+): Record<string, number> {
+  if (workItemIds.length === 0) return {};
+  const placeholders = workItemIds.map(() => "?").join(",");
+  const rows = db
+    .prepare(
+      `SELECT work_item_id, COUNT(*) AS count FROM tracker_execution_audits WHERE work_item_id IN (${placeholders}) AND transcript IS NOT NULL GROUP BY work_item_id`,
+    )
+    .all(...workItemIds) as Array<{ work_item_id: string; count: number }>;
+  const counts: Record<string, number> = {};
+  for (const row of rows) {
+    counts[row.work_item_id] = row.count;
+  }
+  return counts;
 }
 
 /** Get a single execution audit by ID. */

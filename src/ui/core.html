@@ -6446,6 +6446,35 @@
         text-align: center;
       }
 
+      /* ── Session Icon (on cards) — mirrors .card-comment-btn ── */
+      .card-session-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        font-size: 0.7rem;
+        color: var(--text-dim);
+        cursor: pointer;
+        padding: 2px 5px;
+        border-radius: 4px;
+        border: none;
+        background: none;
+        transition: color var(--transition), background var(--transition);
+        -webkit-tap-highlight-color: transparent;
+        line-height: 1;
+      }
+      .card-session-btn:hover {
+        color: var(--text);
+        background: rgba(255, 255, 255, 0.08);
+      }
+      .card-session-btn svg {
+        flex-shrink: 0;
+      }
+      .card-session-btn .session-count-num {
+        font-weight: 600;
+        min-width: 8px;
+        text-align: center;
+      }
+
       /* ── Comment Bottom Sheet ── */
       .comment-sheet-backdrop {
         position: fixed;
@@ -14511,6 +14540,7 @@
       })() : ""}
       ${item.assignee ? `<span class="card-assignee"><svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><circle cx="8" cy="5" r="3.5"/><path d="M1 14.5C1 11.5 4 9.5 8 9.5s7 2 7 5"/></svg> ${esc(item.assignee)}</span>` : ""}
       <button class="card-comment-btn" onclick="openCommentSheet('${esc(item.id)}'); event.stopPropagation();" title="Comments"><svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M2 2a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2v3l3-3h7a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H2z"/></svg><span class="comment-count-num">${item.comment_count || 0}</span></button>
+      ${item.session_count > 0 ? `<button class="card-session-btn" onclick="openSessionsTab('${esc(item.id)}'); event.stopPropagation();" title="Past sessions"><svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0zM6.5 4.5l5 3.5-5 3.5v-7z"/></svg><span class="session-count-num">${item.session_count}</span></button>` : ""}
       <span class="card-time">${timeAgo(item.updated_at)}</span>
     </div>
     ${progressHtml}
@@ -15177,6 +15207,7 @@
               })() : ""}
               ${item.assignee ? `<span class="card-assignee"><svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><circle cx="8" cy="5" r="3.5"/><path d="M1 14.5C1 11.5 4 9.5 8 9.5s7 2 7 5"/></svg> ${esc(item.assignee)}</span>` : ""}
               <button class="card-comment-btn" onclick="openCommentSheet('${esc(item.id)}'); event.stopPropagation();" title="Comments"><svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M2 2a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2v3l3-3h7a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H2z"/></svg><span class="comment-count-num">${item.comment_count || 0}</span></button>
+              ${item.session_count > 0 ? `<button class="card-session-btn" onclick="openSessionsTab('${esc(item.id)}'); event.stopPropagation();" title="Past sessions"><svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0zM6.5 4.5l5 3.5-5 3.5v-7z"/></svg><span class="session-count-num">${item.session_count}</span></button>` : ""}
               <span class="card-time">${timeAgo(item.updated_at)}</span>
             </div>
             ${expandedInfoHtml}
@@ -15497,6 +15528,7 @@
               ${dueBadgeHtml}
               ${item.assignee ? `<span class="card-assignee"><svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><circle cx="8" cy="5" r="3.5"/><path d="M1 14.5C1 11.5 4 9.5 8 9.5s7 2 7 5"/></svg> ${esc(item.assignee)}</span>` : ""}
               <button class="card-comment-btn" onclick="openCommentSheet('${esc(item.id)}'); event.stopPropagation();" title="Comments"><svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M2 2a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2v3l3-3h7a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H2z"/></svg><span class="comment-count-num">${item.comment_count || 0}</span></button>
+              ${item.session_count > 0 ? `<button class="card-session-btn" onclick="openSessionsTab('${esc(item.id)}'); event.stopPropagation();" title="Past sessions"><svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0zM6.5 4.5l5 3.5-5 3.5v-7z"/></svg><span class="session-count-num">${item.session_count}</span></button>` : ""}
               <span class="card-time">${timeAgo(item.updated_at)}</span>
             </div>
           </div>`;
@@ -16510,7 +16542,7 @@
         }
 
         // ── Detail Panel ──
-        async function openDetail(itemId, forceStandard) {
+        async function openDetail(itemId, forceStandard, initialTab) {
           // Check local cache for space_type to route to space overlay
           if (!forceStandard && trackerData && trackerData.tracker) {
             for (const stateItems of Object.values(trackerData.tracker)) {
@@ -16527,8 +16559,9 @@
           detailOverlay.classList.add("open");
           detailPanel.classList.add("open");
           document.body.style.overflow = "hidden";
-          // Reset to Settings tab when opening a new item
-          switchDetailTab("settings");
+          // Reset tab when opening a new item — caller can request an initial tab
+          // (e.g. the card-session-btn jumps straight to "sessions")
+          switchDetailTab(initialTab || "settings");
 
           try {
             const item = await apiGet(`/items/${itemId}`);
@@ -18668,6 +18701,15 @@
             (a) => lower.includes(a)
           );
         }
+
+        /**
+         * Open the detail panel jumped straight to the Sessions tab.
+         * Used by the card-session-btn so kanban cards can deep-link into
+         * past session transcripts in one click.
+         */
+        window.openSessionsTab = function(itemId) {
+          openDetail(itemId, false, "sessions");
+        };
 
         /** Open the comment bottom sheet for a work item */
         window.openCommentSheet = async function(itemId) {

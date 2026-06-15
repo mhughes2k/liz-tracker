@@ -46,6 +46,10 @@ import {
   splitItem,
   bulkUpdate,
   createComment,
+  createExecutionAudit,
+  completeExecutionAudit,
+  countExecutionAuditsWithTranscript,
+  getSessionCountsBatch,
   deleteComment,
   updateComment,
   listComments,
@@ -3748,5 +3752,71 @@ describe('Proposals (TRACK-284)', () => {
     const links = listLinks(a.id);
     const proposalLink = links.find((l) => l.source === 'proposal');
     expect(proposalLink).toBeDefined();
+  });
+});
+
+// ── Session counts (TRACK-291) ──────────────────────────────────────────────
+describe('Session counts (TRACK-291)', () => {
+  beforeEach(() => {
+    _initTestTrackerDatabase();
+  });
+
+  // Three audits per item: one with a transcript, one with an empty transcript
+  // (NULL after coerce), and one still pending. Only the one with a real
+  // transcript should count — that's what the Sessions tab actually renders.
+  function seedAudits(workItemId: string, transcripts: (string | null)[]): void {
+    transcripts.forEach((t, idx) => {
+      const sessionId = `sess_${workItemId}_${idx}`;
+      createExecutionAudit({ work_item_id: workItemId, session_id: sessionId });
+      if (t !== null) {
+        completeExecutionAudit(sessionId, { exit_status: 'success', transcript: t });
+      }
+    });
+  }
+
+  it('countExecutionAuditsWithTranscript only counts audits whose transcript is non-NULL', () => {
+    const proj = createProject({ name: 'p', short_name: 'P', description: '' });
+    const item = createWorkItem({
+      project_id: proj.id,
+      title: 'item',
+      description: '',
+      created_by: 'dashboard',
+    });
+    seedAudits(item.id, ['{"events":[]}', null, '{"events":["hi"]}']);
+    expect(countExecutionAuditsWithTranscript(item.id)).toBe(2);
+  });
+
+  it('getSessionCountsBatch returns a map keyed by work_item_id, skipping items with zero', () => {
+    const proj = createProject({ name: 'p', short_name: 'P', description: '' });
+    const itemA = createWorkItem({
+      project_id: proj.id,
+      title: 'a',
+      description: '',
+      created_by: 'dashboard',
+    });
+    const itemB = createWorkItem({
+      project_id: proj.id,
+      title: 'b',
+      description: '',
+      created_by: 'dashboard',
+    });
+    const itemC = createWorkItem({
+      project_id: proj.id,
+      title: 'c',
+      description: '',
+      created_by: 'dashboard',
+    });
+    seedAudits(itemA.id, ['{"events":[]}', '{"events":[]}']); // 2 transcripts
+    seedAudits(itemB.id, [null, null]);                       // 0 transcripts (pending)
+    // itemC: no audits at all                                 // 0 transcripts
+
+    const counts = getSessionCountsBatch([itemA.id, itemB.id, itemC.id]);
+    expect(counts[itemA.id]).toBe(2);
+    expect(counts[itemB.id]).toBeUndefined();
+    expect(counts[itemC.id]).toBeUndefined();
+  });
+
+  it('getSessionCountsBatch returns an empty object for an empty input', () => {
+    expect(getSessionCountsBatch([])).toEqual({});
   });
 });

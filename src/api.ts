@@ -95,6 +95,7 @@ import {
   getAttentionItems,
   getExecutionAudits,
   countExecutionAuditsWithTranscript,
+  getSessionCountsBatch,
   getExecutionAudit,
   setAuditSessionTitle,
   createAttachment,
@@ -604,6 +605,9 @@ async function handleApiRequest(
         // TRACK-281: batch fetch child counts so kanban cards can render
         // "12/15 done" progress rollups without per-card requests.
         const childCounts = getChildCountsBatch(items.map((i) => i.id));
+        // TRACK-291: batch fetch session (audit) counts so kanban cards can
+        // show a past-sessions badge without one query per card.
+        const sessionCounts = getSessionCountsBatch(items.map((i) => i.id));
         const enriched = items.map((i) => {
           const key = `${project.short_name}-${i.seq_number}`;
           return {
@@ -612,6 +616,7 @@ async function handleApiRequest(
             url: buildItemUrl(key),
             comment_count: commentCounts[i.id] || 0,
             child_counts: childCounts.get(i.id) || null,
+            session_count: sessionCounts[i.id] || 0,
           };
         });
         const tracker: Record<string, typeof enriched> = {};
@@ -2063,6 +2068,9 @@ Extract the structured fields from this description. Return ONLY valid JSON.`;
       const projectMap = new Map(allProjects.map((p) => [p.id, p]));
       const allItems = listWorkItems({});
       const commentCounts = getCommentCounts(allItems.map((i) => i.id));
+      // TRACK-291: include past-session counts so cross-project kanban cards
+      // can show the same session badge as project-scoped cards.
+      const sessionCounts = getSessionCountsBatch(allItems.map((i) => i.id));
       const enriched = allItems.map((i) => {
         const proj = projectMap.get(i.project_id);
         const prefix = proj?.short_name || "???";
@@ -2074,6 +2082,7 @@ Extract the structured fields from this description. Return ONLY valid JSON.`;
           project_name: proj?.name || "Unknown",
           project_theme: proj?.theme || "midnight",
           comment_count: commentCounts[i.id] || 0,
+          session_count: sessionCounts[i.id] || 0,
         };
       });
       const tracker: Record<string, typeof enriched> = {};
