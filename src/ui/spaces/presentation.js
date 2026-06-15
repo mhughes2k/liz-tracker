@@ -369,32 +369,121 @@ async function loadPresDeckThumbnails(slug, forceRefresh) {
       data.thumbnails.forEach((thumbUrl, i) => {
         const div = document.createElement("div");
         div.className = "pres-deck-thumb";
+        div.draggable = true;
+        div.dataset.origIndex = String(i);
         const heading = (slideTitles[i] || "").toString().trim();
         const labelText = heading ? `Slide ${i + 1}: ${heading}` : `Slide ${i + 1}`;
-        div.title = `${labelText} — click to open at this slide`;
+        div.title = `${labelText} — click to open, drag to reorder`;
         // Thumbnail URLs are tracker-local (served through the tracker proxy)
         const imgSrc = cacheBustSuffix ? thumbUrl + (thumbUrl.includes("?") ? "&" : "?") + "t=" + cacheBustSuffix : thumbUrl;
         div.innerHTML = `
           <button class="pres-deck-thumb-delete" type="button" title="Delete ${esc(labelText)}" aria-label="Delete ${esc(labelText)}">&times;</button>
-          <img src="${esc(imgSrc)}" alt="${esc(labelText)}" loading="lazy">
+          <img src="${esc(imgSrc)}" alt="${esc(labelText)}" loading="lazy" draggable="false">
           <div class="pres-deck-thumb-label">${esc(labelText)}</div>
         `;
         div.addEventListener("click", (e) => {
           if (e.target.closest(".pres-deck-thumb-delete") || e.target.closest(".pres-deck-thumb-confirm")) return;
-          window.open(`${deckUrl}/${slug}/#${i + 1}`, "_blank");
+          // Use the card's current visual position, not the original index,
+          // so a partially-reordered (unsaved) view still opens the right slide.
+          const livePos = Array.from(grid.children).indexOf(div);
+          window.open(`${deckUrl}/${slug}/#${(livePos >= 0 ? livePos : i) + 1}`, "_blank");
         });
         const delBtn = div.querySelector(".pres-deck-thumb-delete");
         delBtn.addEventListener("click", (e) => {
           e.stopPropagation();
-          showPresDeleteConfirm(div, i, slug, heading);
+          // Original index in the deck is whatever the card is currently sitting
+          // on — we always reorder before delete (saved or not), so the visual
+          // position matches the deck.mdx position.
+          const livePos = Array.from(grid.children).indexOf(div);
+          showPresDeleteConfirm(div, livePos >= 0 ? livePos : i, slug, heading);
         });
         grid.appendChild(div);
       });
+      bindPresDeckDragReorder(grid, slug);
     } else {
       content.innerHTML = '<div class="pres-deck-loading">No slides found in this deck</div>';
     }
   } catch (e) {
     content.innerHTML = `<div class="pres-deck-loading">Failed to load thumbnails: ${esc(e.message || String(e))}</div>`;
+  }
+}
+
+// ── Slide Reorder (drag-and-drop on thumbnails) ──
+// Drag a thumbnail card onto another to move it in place. On drop we POST the
+// new order (an array of old indices) to /deck-reorder; the server rewrites
+// deck.mdx and shifts cached thumbnails so the change propagates precisely to
+// DeckWright. The whole grid then reloads so labels/numbers reflect the saved
+// state and the live preview can pick up the changes.
+function bindPresDeckDragReorder(grid, slug) {
+  if (!grid) return;
+  let dragEl = null;
+
+  grid.addEventListener("dragstart", (e) => {
+    const card = e.target.closest(".pres-deck-thumb");
+    if (!card || !grid.contains(card)) return;
+    dragEl = card;
+    card.classList.add("pres-deck-thumb-dragging");
+    try { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", "slide"); } catch {}
+  });
+
+  grid.addEventListener("dragend", () => {
+    if (dragEl) dragEl.classList.remove("pres-deck-thumb-dragging");
+    dragEl = null;
+    grid.querySelectorAll(".pres-deck-thumb-drop-target").forEach((el) => el.classList.remove("pres-deck-thumb-drop-target"));
+  });
+
+  grid.addEventListener("dragover", (e) => {
+    if (!dragEl) return;
+    e.preventDefault();
+    try { e.dataTransfer.dropEffect = "move"; } catch {}
+    const target = e.target.closest(".pres-deck-thumb");
+    if (!target || target === dragEl || !grid.contains(target)) return;
+    // Insert dragEl before/after target based on horizontal+vertical midpoint —
+    // works for grid-laid cards. Use bounding rect center as the boundary.
+    const rect = target.getBoundingClientRect();
+    const before = e.clientY < rect.top + rect.height / 2 ||
+      (Math.abs(e.clientY - (rect.top + rect.height / 2)) < 8 && e.clientX < rect.left + rect.width / 2);
+    if (before) {
+      grid.insertBefore(dragEl, target);
+    } else {
+      grid.insertBefore(dragEl, target.nextSibling);
+    }
+  });
+
+  grid.addEventListener("drop", async (e) => {
+    if (!dragEl) return;
+    e.preventDefault();
+    dragEl.classList.remove("pres-deck-thumb-dragging");
+    dragEl = null;
+    const order = Array.from(grid.children).map((c) => parseInt(c.dataset.origIndex, 10));
+    if (order.some((n) => Number.isNaN(n))) return;
+    // If the order is unchanged, skip the round-trip
+    const unchanged = order.every((n, i) => n === i);
+    if (unchanged) return;
+    await savePresDeckReorder(slug, order);
+  });
+}
+
+async function savePresDeckReorder(slug, order) {
+  const content = $("#presDeckContent");
+  try {
+    await apiPost(`/items/${spaceItemId}/presentation/deck-reorder`, { order });
+    toast("Slides reordered", "success");
+    if (content) content.innerHTML = '<div class="pres-deck-loading">Refreshing thumbnails...</div>';
+    loadPresDeckThumbnails(slug);
+    // Invalidate Slides tab so MDX re-fetches
+    presSlidesMdxLoaded = false;
+    const slidesPanel = $("#presTabSlides");
+    if (slidesPanel && slidesPanel.classList.contains("active")) {
+      const mdxEl = $("#presMdxContent");
+      if (mdxEl) mdxEl.innerHTML = '<div class="pres-mdx-empty">Reloading deck source...</div>';
+      loadPresMdx();
+    }
+  } catch (err) {
+    toast("Failed to reorder slides: " + (err.message || err), "error");
+    // Reload to restore the saved order on screen
+    if (content) content.innerHTML = '<div class="pres-deck-loading">Refreshing thumbnails...</div>';
+    loadPresDeckThumbnails(slug);
   }
 }
 

@@ -232,6 +232,93 @@ export function shiftThumbnailsAfterSlideDelete(opts: {
 }
 
 /**
+ * Shift thumbnail files in DeckWright's cache after reordering slides.
+ * `order` is an array of OLD indices in the NEW position order, e.g. [2,0,1]
+ * means "new slide 0 was old slide 2, new slide 1 was old slide 0, …".
+ *
+ * Returns true on success — the caller should not touch deck.mdx mtime again
+ * because the cache .meta.json is rewritten to match the new mtime. Returns
+ * false when the cache is missing/mismatched so the caller can fall back to a
+ * full DeckWright regeneration.
+ *
+ * Strategy: write each kept file to a temp name keyed by NEW position, then
+ * swap them back to canonical slide-NNN.png names. This avoids overwriting any
+ * file we still need to read.
+ *
+ * Exported for unit testing.
+ */
+export function shiftThumbnailsAfterSlideReorder(opts: {
+  deckThumbDir: string;
+  order: number[];          // newPos -> oldIndex
+  oldSlideCount: number;
+  newMdxMtimeMs: number;
+}): boolean {
+  const { deckThumbDir, order, oldSlideCount, newMdxMtimeMs } = opts;
+  const metaFile = join(deckThumbDir, ".meta.json");
+  if (!existsSync(metaFile)) return false;
+
+  let meta: DeckwrightThumbnailMeta;
+  try {
+    const parsed = JSON.parse(readFileSync(metaFile, "utf-8")) as DeckwrightThumbnailMeta;
+    if (!Array.isArray(parsed.thumbnails)) return false;
+    meta = parsed;
+  } catch {
+    return false;
+  }
+
+  if (meta.thumbnails.length !== oldSlideCount) return false;
+  if (order.length !== oldSlideCount) return false;
+  for (const idx of order) {
+    if (!Number.isInteger(idx) || idx < 0 || idx >= oldSlideCount) return false;
+  }
+  // No-op reorder: still rewrite mtime so caller's mdx write doesn't invalidate cache.
+  const isIdentity = order.every((idx, i) => idx === i);
+
+  const filenames = meta.thumbnails.map(thumbnailFilenameFromUrl);
+  const slugBase = deckThumbDir.split("/").pop() || "";
+
+  // 1. Rename every existing slide file to a temp name keyed by its NEW
+  //    position. We only move the files we keep — since this is a reorder
+  //    (not a delete) every old index appears exactly once in `order`.
+  if (!isIdentity) {
+    for (let newPos = 0; newPos < order.length; newPos++) {
+      const oldIdx = order[newPos];
+      const sourceFilename = filenames[oldIdx];
+      if (!sourceFilename) continue;
+      const from = join(deckThumbDir, sourceFilename);
+      const tmp = join(deckThumbDir, `__reorder_${newPos}.png`);
+      if (existsSync(from)) {
+        try { renameSync(from, tmp); } catch { return false; }
+      }
+    }
+
+    // 2. Swap each temp file back to its canonical slide-NNN.png name.
+    for (let newPos = 0; newPos < order.length; newPos++) {
+      const tmp = join(deckThumbDir, `__reorder_${newPos}.png`);
+      const target = join(deckThumbDir, slideThumbFilename(newPos + 1));
+      if (existsSync(tmp)) {
+        try { renameSync(tmp, target); } catch { return false; }
+      }
+    }
+  }
+
+  // 3. Rewrite .meta.json so DeckWright's cache check passes against the new mdx mtime.
+  try {
+    const newThumbnails = order.map((_, newPos) => `/thumbnails/${slugBase}/${slideThumbFilename(newPos + 1)}`);
+    const newMeta: DeckwrightThumbnailMeta = {
+      mdxMtime: newMdxMtimeMs,
+      thumbnails: newThumbnails,
+      generatedAt: Date.now(),
+    };
+    writeFileSync(metaFile, JSON.stringify(newMeta));
+  } catch {
+    return false;
+  }
+
+  return true;
+}
+
+/**
  * Invalidate Tracker's local thumbnail cache for a deck by deleting every
  * slide-*.png file in the cache directory. The next deck-thumbnails request
  * will re-fetch from DeckWright, picking up the freshly shifted files.
@@ -478,6 +565,89 @@ const presentationApiRoutes: SpaceApiRoute[] = [
         ok: true,
         remaining: slides.length,
         deleted_index: index,
+        thumbnails_shifted: shifted,
+        local_thumbs_invalidated: localInvalidated,
+      });
+    },
+  },
+  // POST /items/:id/presentation/deck-reorder — reorder slides in deck.mdx
+  // Body: { order: number[] } where order[newPos] = oldIndex
+  {
+    method: "POST",
+    path: "deck-reorder",
+    handler: async (req, res, item) => {
+      const spaceData = parsePresentationSpaceData(item.space_data);
+      if (!spaceData.deck_slug) {
+        return errorResponse(res, "No deck configured", 400);
+      }
+
+      let body: Record<string, unknown>;
+      try {
+        body = await parseRequestBody(req);
+      } catch (e: unknown) {
+        return errorResponse(res, e instanceof Error ? e.message : "Invalid body", 400);
+      }
+
+      const order = body.order;
+      if (!Array.isArray(order)) {
+        return errorResponse(res, "order must be an array", 400);
+      }
+
+      const filepath = join(DECKWRIGHT_DECKS_DIR, spaceData.deck_slug, "deck.mdx");
+      let raw: string;
+      try {
+        raw = readFileSync(filepath, "utf-8");
+      } catch {
+        return errorResponse(res, `deck.mdx not found for ${spaceData.deck_slug}`, 404);
+      }
+
+      const slides = parseSlideRaws(raw);
+      if (order.length !== slides.length) {
+        return errorResponse(res, `order length ${order.length} does not match slide count ${slides.length}`, 400);
+      }
+      const seen = new Set<number>();
+      for (const raw of order) {
+        const idx = typeof raw === "number" ? raw : Number(raw);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= slides.length || seen.has(idx)) {
+          return errorResponse(res, "order must be a permutation of 0..N-1", 400);
+        }
+        seen.add(idx);
+      }
+      const normalizedOrder = (order as unknown[]).map((v) => Number(v));
+
+      const oldSlideCount = slides.length;
+      const reordered = normalizedOrder.map((oldIdx) => slides[oldIdx]);
+      const newContent = serializeSlideRaws(reordered);
+      try {
+        writeFileSync(filepath, newContent, "utf-8");
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return errorResponse(res, `Failed to write deck.mdx: ${msg}`, 500);
+      }
+
+      // Shift thumbnails in place so DeckWright doesn't re-run Playwright across
+      // the whole deck. If the cache is missing/mismatched, fall back to a full
+      // regeneration on the next thumbnails fetch.
+      let shifted = false;
+      try {
+        const newMtimeMs = statSync(filepath).mtimeMs;
+        shifted = shiftThumbnailsAfterSlideReorder({
+          deckThumbDir: join(DECKWRIGHT_THUMBS_DIR, spaceData.deck_slug),
+          order: normalizedOrder,
+          oldSlideCount,
+          newMdxMtimeMs: newMtimeMs,
+        });
+      } catch {
+        shifted = false;
+      }
+
+      // Always wipe Tracker's local thumb cache — every cached PNG whose new
+      // position differs from its old position now points at the wrong slide.
+      const localInvalidated = invalidateLocalThumbCache(join(THUMB_CACHE_DIR, spaceData.deck_slug));
+
+      jsonResponse(res, {
+        ok: true,
+        remaining: slides.length,
         thumbnails_shifted: shifted,
         local_thumbs_invalidated: localInvalidated,
       });

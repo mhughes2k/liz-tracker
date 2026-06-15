@@ -50,7 +50,7 @@ Standalone project management tracker with kanban UI, REST API, MCP tools, and O
 | `src/spaces/engagement.ts` | Parser, 6 API routes, 7 MCP tools |
 | `src/spaces/scheduled.ts` | Parser, sanitizer, 4 API routes, 4 MCP tools |
 | `src/spaces/travel.ts` | Parser, sanitizer, deep merge, 4 API routes, 4 MCP tools, cover image |
-| `src/spaces/presentation.ts` | Parser, sanitizer, 5 API routes (deck PATCH, deck-mdx GET, deck-thumbnails GET proxy, deck-thumb GET cached image, deck-slide DELETE), DeckWright integration |
+| `src/spaces/presentation.ts` | Parser, sanitizer, 6 API routes (deck PATCH, deck-mdx GET, deck-thumbnails GET proxy, deck-thumb GET cached image, deck-slide DELETE, deck-reorder POST), DeckWright integration |
 | `src/ui/core.html` | Dashboard shell + space plugin registry + overlay shell |
 | `src/ui/spaces/standard.js` | Registry entry only (~15 lines) |
 | `src/ui/spaces/song.js` | Song UI renderer (~735 lines) |
@@ -747,6 +747,7 @@ tracker_add_travel_segment({
 - `GET /items/:id/presentation/deck-thumbnails` — fetch thumbnail list from DeckWright, cache locally, return tracker-proxied URLs (pass `?refresh=1` to bust cache)
 - `GET /items/:id/presentation/deck-thumb?file=...` — serve a cached deck thumbnail image (no auth required)
 - `DELETE /items/:id/presentation/deck-slide?index=N` — remove slide N from deck.mdx (shifts cached thumbnails in place when possible to avoid a full Playwright regen; refuses to delete the last remaining slide)
+- `POST /items/:id/presentation/deck-reorder` — reorder slides in deck.mdx (body `{order: number[]}` where `order[newPos] = oldIndex`, must be a permutation of 0..N-1). Rewrites deck.mdx and renames DeckWright's cached thumbnails in place via a temp-name swap so canonical `slide-NNN.png` filenames stay aligned with the new order, then invalidates Tracker's local thumb cache.
 - `POST /comments/:id/reactions` — toggle an emoji reaction on a comment (`{ emoji, author? }`)
 - `GET /comments/:id/reactions` — get aggregated reactions for a comment
 

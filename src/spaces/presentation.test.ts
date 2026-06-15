@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, mkdtempSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { parseSlideRaws, serializeSlideRaws, shiftThumbnailsAfterSlideDelete, extractSlideHeading, invalidateLocalThumbCache } from "./presentation.js";
+import { parseSlideRaws, serializeSlideRaws, shiftThumbnailsAfterSlideDelete, shiftThumbnailsAfterSlideReorder, extractSlideHeading, invalidateLocalThumbCache } from "./presentation.js";
 
 const SAMPLE = `---
 layout: TitleSlide
@@ -307,6 +307,182 @@ describe("shiftThumbnailsAfterSlideDelete", () => {
     seedDeckwrightCache("demo", 3, 1000);
     const ok = shiftThumbnailsAfterSlideDelete({
       deckThumbDir, deletedIndex: 0, oldSlideCount: 5, newMdxMtimeMs: 2000,
+    });
+    expect(ok).toBe(false);
+  });
+});
+
+// Reorder must propagate to deck.mdx AND keep DeckWright's positional thumbnail
+// cache coherent. The two checks here are: (a) the serialized deck reflects the
+// new slide order exactly, and (b) thumbnail files are renamed in place so each
+// canonical slide-NNN.png still points at the correct slide content.
+describe("parseSlideRaws / serializeSlideRaws — reorder", () => {
+  const FIVE = `---
+layout: TitleSlide
+---
+
+# Deck Title
+
+---
+---
+layout: ContentSlide
+---
+
+## Slide Two
+
+---
+---
+layout: ContentSlide
+---
+
+## Slide Three
+
+---
+---
+layout: ContentSlide
+---
+
+## Slide Four
+
+---
+---
+layout: ContentSlide
+---
+
+## Slide Five`;
+
+  it("reorders slides according to the order array", () => {
+    const slides = parseSlideRaws(FIVE);
+    // New order: [4, 0, 2, 1, 3] -> Five, Title, Three, Two, Four
+    const order = [4, 0, 2, 1, 3];
+    const reordered = order.map((i) => slides[i]);
+    const reparsed = parseSlideRaws(serializeSlideRaws(reordered));
+    expect(reparsed).toHaveLength(5);
+    expect(reparsed[0].content).toContain("## Slide Five");
+    expect(reparsed[1].content).toContain("# Deck Title");
+    expect(reparsed[2].content).toContain("## Slide Three");
+    expect(reparsed[3].content).toContain("## Slide Two");
+    expect(reparsed[4].content).toContain("## Slide Four");
+  });
+});
+
+describe("shiftThumbnailsAfterSlideReorder", () => {
+  let workDir: string;
+  let deckThumbDir: string;
+
+  function seedDeckwrightCache(slug: string, count: number, mdxMtime: number) {
+    deckThumbDir = join(workDir, "deckwright", slug);
+    mkdirSync(deckThumbDir, { recursive: true });
+    const thumbnails: string[] = [];
+    for (let i = 1; i <= count; i++) {
+      const filename = `slide-${String(i).padStart(3, "0")}.png`;
+      writeFileSync(join(deckThumbDir, filename), `deckwright-${i}`);
+      thumbnails.push(`/thumbnails/${slug}/${filename}`);
+    }
+    writeFileSync(
+      join(deckThumbDir, ".meta.json"),
+      JSON.stringify({ mdxMtime, thumbnails, generatedAt: Date.now() }),
+    );
+  }
+
+  beforeEach(() => {
+    workDir = mkdtempSync(join(tmpdir(), "presentation-reorder-test-"));
+  });
+
+  afterEach(() => {
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("renames thumbnail files to match a non-trivial reorder", () => {
+    seedDeckwrightCache("demo", 5, 1000);
+    // New order: [4, 0, 2, 1, 3]
+    const ok = shiftThumbnailsAfterSlideReorder({
+      deckThumbDir,
+      order: [4, 0, 2, 1, 3],
+      oldSlideCount: 5,
+      newMdxMtimeMs: 2000,
+    });
+    expect(ok).toBe(true);
+    // slide-001 was old slide 5
+    expect(readFileSync(join(deckThumbDir, "slide-001.png"), "utf-8")).toBe("deckwright-5");
+    expect(readFileSync(join(deckThumbDir, "slide-002.png"), "utf-8")).toBe("deckwright-1");
+    expect(readFileSync(join(deckThumbDir, "slide-003.png"), "utf-8")).toBe("deckwright-3");
+    expect(readFileSync(join(deckThumbDir, "slide-004.png"), "utf-8")).toBe("deckwright-2");
+    expect(readFileSync(join(deckThumbDir, "slide-005.png"), "utf-8")).toBe("deckwright-4");
+    const meta = JSON.parse(readFileSync(join(deckThumbDir, ".meta.json"), "utf-8"));
+    expect(meta.mdxMtime).toBe(2000);
+    expect(meta.thumbnails).toEqual([
+      "/thumbnails/demo/slide-001.png",
+      "/thumbnails/demo/slide-002.png",
+      "/thumbnails/demo/slide-003.png",
+      "/thumbnails/demo/slide-004.png",
+      "/thumbnails/demo/slide-005.png",
+    ]);
+    // No leftover temp files
+    expect(existsSync(join(deckThumbDir, "__reorder_0.png"))).toBe(false);
+  });
+
+  it("handles a simple adjacent swap without clobbering either file", () => {
+    seedDeckwrightCache("demo", 3, 1000);
+    const ok = shiftThumbnailsAfterSlideReorder({
+      deckThumbDir,
+      order: [1, 0, 2],
+      oldSlideCount: 3,
+      newMdxMtimeMs: 2000,
+    });
+    expect(ok).toBe(true);
+    expect(readFileSync(join(deckThumbDir, "slide-001.png"), "utf-8")).toBe("deckwright-2");
+    expect(readFileSync(join(deckThumbDir, "slide-002.png"), "utf-8")).toBe("deckwright-1");
+    expect(readFileSync(join(deckThumbDir, "slide-003.png"), "utf-8")).toBe("deckwright-3");
+  });
+
+  it("returns true on identity reorder and just bumps mdxMtime", () => {
+    seedDeckwrightCache("demo", 3, 1000);
+    const ok = shiftThumbnailsAfterSlideReorder({
+      deckThumbDir,
+      order: [0, 1, 2],
+      oldSlideCount: 3,
+      newMdxMtimeMs: 2000,
+    });
+    expect(ok).toBe(true);
+    // Files untouched
+    expect(readFileSync(join(deckThumbDir, "slide-001.png"), "utf-8")).toBe("deckwright-1");
+    expect(readFileSync(join(deckThumbDir, "slide-002.png"), "utf-8")).toBe("deckwright-2");
+    expect(readFileSync(join(deckThumbDir, "slide-003.png"), "utf-8")).toBe("deckwright-3");
+    const meta = JSON.parse(readFileSync(join(deckThumbDir, ".meta.json"), "utf-8"));
+    expect(meta.mdxMtime).toBe(2000);
+  });
+
+  it("returns false when order has wrong length", () => {
+    seedDeckwrightCache("demo", 3, 1000);
+    const ok = shiftThumbnailsAfterSlideReorder({
+      deckThumbDir,
+      order: [1, 0],
+      oldSlideCount: 3,
+      newMdxMtimeMs: 2000,
+    });
+    expect(ok).toBe(false);
+  });
+
+  it("returns false when order contains an out-of-range index", () => {
+    seedDeckwrightCache("demo", 3, 1000);
+    const ok = shiftThumbnailsAfterSlideReorder({
+      deckThumbDir,
+      order: [1, 0, 5],
+      oldSlideCount: 3,
+      newMdxMtimeMs: 2000,
+    });
+    expect(ok).toBe(false);
+  });
+
+  it("returns false when .meta.json is missing so caller falls back to regen", () => {
+    deckThumbDir = join(workDir, "deckwright", "demo");
+    mkdirSync(deckThumbDir, { recursive: true });
+    const ok = shiftThumbnailsAfterSlideReorder({
+      deckThumbDir,
+      order: [1, 0, 2],
+      oldSlideCount: 3,
+      newMdxMtimeMs: 2000,
     });
     expect(ok).toBe(false);
   });

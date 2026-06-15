@@ -8443,11 +8443,18 @@
         border: 1px solid var(--border);
         overflow: hidden;
         background: rgba(16, 21, 38, 0.3);
-        transition: border-color 0.15s;
-        cursor: pointer;
+        transition: border-color 0.15s, opacity 0.15s, transform 0.15s;
+        cursor: grab;
       }
       .pres-deck-thumb:hover {
         border-color: var(--highlight);
+      }
+      .pres-deck-thumb:active {
+        cursor: grabbing;
+      }
+      .pres-deck-thumb-dragging {
+        opacity: 0.45;
+        transform: scale(0.97);
       }
       .pres-deck-thumb-delete {
         position: absolute;
