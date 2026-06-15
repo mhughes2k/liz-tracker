@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, mkdtempSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { parseSlideRaws, serializeSlideRaws, shiftThumbnailsAfterSlideDelete, extractSlideHeading } from "./presentation.js";
+import { parseSlideRaws, serializeSlideRaws, shiftThumbnailsAfterSlideDelete, extractSlideHeading, invalidateLocalThumbCache } from "./presentation.js";
 
 const SAMPLE = `---
 layout: TitleSlide
@@ -210,21 +210,19 @@ describe("extractSlideHeading", () => {
 describe("shiftThumbnailsAfterSlideDelete", () => {
   let workDir: string;
   let deckThumbDir: string;
-  let localThumbDir: string;
 
-  // Seed DeckWright's public/thumbnails/{slug} and tracker's local cache with N
-  // thumbnails plus a .meta.json that points at them. Files contain unique bytes
-  // so we can verify the right file ended up in the right slot after rename.
-  function seedCaches(slug: string, count: number, mdxMtime: number) {
+  // Seed DeckWright's public/thumbnails/{slug} with N thumbnails plus a
+  // .meta.json that points at them. Files contain unique bytes so we can verify
+  // the right file ended up in the right slot after rename. The Tracker local
+  // cache is intentionally NOT touched by this function (see comment on
+  // shiftThumbnailsAfterSlideDelete) so it isn't seeded here.
+  function seedDeckwrightCache(slug: string, count: number, mdxMtime: number) {
     deckThumbDir = join(workDir, "deckwright", slug);
-    localThumbDir = join(workDir, "local", slug);
     mkdirSync(deckThumbDir, { recursive: true });
-    mkdirSync(localThumbDir, { recursive: true });
     const thumbnails: string[] = [];
     for (let i = 1; i <= count; i++) {
       const filename = `slide-${String(i).padStart(3, "0")}.png`;
       writeFileSync(join(deckThumbDir, filename), `deckwright-${i}`);
-      writeFileSync(join(localThumbDir, filename), `local-${i}`);
       thumbnails.push(`/thumbnails/${slug}/${filename}`);
     }
     writeFileSync(
@@ -242,29 +240,24 @@ describe("shiftThumbnailsAfterSlideDelete", () => {
   });
 
   it("renames thumbnails in place when deleting a middle slide and rewrites .meta.json", () => {
-    seedCaches("demo", 5, 1000);
+    seedDeckwrightCache("demo", 5, 1000);
 
     const ok = shiftThumbnailsAfterSlideDelete({
       deckThumbDir,
-      localThumbDir,
       deletedIndex: 2,
       oldSlideCount: 5,
       newMdxMtimeMs: 2000,
     });
 
     expect(ok).toBe(true);
-    // Position 3 (the deleted slide) is gone in both caches
+    // Position 5 (the trailing file) is gone — deck shrunk by one
     expect(existsSync(join(deckThumbDir, "slide-005.png"))).toBe(false);
-    expect(existsSync(join(localThumbDir, "slide-005.png"))).toBe(false);
     // Positions 1-2 untouched
     expect(readFileSync(join(deckThumbDir, "slide-001.png"), "utf-8")).toBe("deckwright-1");
     expect(readFileSync(join(deckThumbDir, "slide-002.png"), "utf-8")).toBe("deckwright-2");
     // Position 3 now holds what was position 4; position 4 holds what was position 5
     expect(readFileSync(join(deckThumbDir, "slide-003.png"), "utf-8")).toBe("deckwright-4");
     expect(readFileSync(join(deckThumbDir, "slide-004.png"), "utf-8")).toBe("deckwright-5");
-    // Local cache shifted in lockstep
-    expect(readFileSync(join(localThumbDir, "slide-003.png"), "utf-8")).toBe("local-4");
-    expect(readFileSync(join(localThumbDir, "slide-004.png"), "utf-8")).toBe("local-5");
     // .meta.json reflects new state and new mdx mtime
     const meta = JSON.parse(readFileSync(join(deckThumbDir, ".meta.json"), "utf-8"));
     expect(meta.mdxMtime).toBe(2000);
@@ -277,9 +270,9 @@ describe("shiftThumbnailsAfterSlideDelete", () => {
   });
 
   it("shifts cleanly when deleting the first slide", () => {
-    seedCaches("demo", 4, 1000);
+    seedDeckwrightCache("demo", 4, 1000);
     const ok = shiftThumbnailsAfterSlideDelete({
-      deckThumbDir, localThumbDir, deletedIndex: 0, oldSlideCount: 4, newMdxMtimeMs: 2000,
+      deckThumbDir, deletedIndex: 0, oldSlideCount: 4, newMdxMtimeMs: 2000,
     });
     expect(ok).toBe(true);
     expect(readFileSync(join(deckThumbDir, "slide-001.png"), "utf-8")).toBe("deckwright-2");
@@ -289,9 +282,9 @@ describe("shiftThumbnailsAfterSlideDelete", () => {
   });
 
   it("just deletes the file when deleting the last slide (nothing to rename)", () => {
-    seedCaches("demo", 3, 1000);
+    seedDeckwrightCache("demo", 3, 1000);
     const ok = shiftThumbnailsAfterSlideDelete({
-      deckThumbDir, localThumbDir, deletedIndex: 2, oldSlideCount: 3, newMdxMtimeMs: 2000,
+      deckThumbDir, deletedIndex: 2, oldSlideCount: 3, newMdxMtimeMs: 2000,
     });
     expect(ok).toBe(true);
     expect(readFileSync(join(deckThumbDir, "slide-001.png"), "utf-8")).toBe("deckwright-1");
@@ -303,32 +296,82 @@ describe("shiftThumbnailsAfterSlideDelete", () => {
 
   it("returns false when .meta.json is missing so caller falls back to full regen", () => {
     deckThumbDir = join(workDir, "deckwright", "demo");
-    localThumbDir = join(workDir, "local", "demo");
     mkdirSync(deckThumbDir, { recursive: true });
-    mkdirSync(localThumbDir, { recursive: true });
     const ok = shiftThumbnailsAfterSlideDelete({
-      deckThumbDir, localThumbDir, deletedIndex: 0, oldSlideCount: 3, newMdxMtimeMs: 2000,
+      deckThumbDir, deletedIndex: 0, oldSlideCount: 3, newMdxMtimeMs: 2000,
     });
     expect(ok).toBe(false);
   });
 
   it("returns false when cached thumbnail count disagrees with the deck", () => {
-    seedCaches("demo", 3, 1000);
+    seedDeckwrightCache("demo", 3, 1000);
     const ok = shiftThumbnailsAfterSlideDelete({
-      deckThumbDir, localThumbDir, deletedIndex: 0, oldSlideCount: 5, newMdxMtimeMs: 2000,
+      deckThumbDir, deletedIndex: 0, oldSlideCount: 5, newMdxMtimeMs: 2000,
     });
     expect(ok).toBe(false);
   });
+});
 
-  it("tolerates a missing local cache entry (tracker hasn't fetched yet)", () => {
-    seedCaches("demo", 3, 1000);
-    // Wipe one of the local cache files — that thumbnail was never fetched
-    rmSync(join(localThumbDir, "slide-002.png"));
-    const ok = shiftThumbnailsAfterSlideDelete({
-      deckThumbDir, localThumbDir, deletedIndex: 0, oldSlideCount: 3, newMdxMtimeMs: 2000,
-    });
-    expect(ok).toBe(true);
-    expect(readFileSync(join(deckThumbDir, "slide-001.png"), "utf-8")).toBe("deckwright-2");
-    expect(readFileSync(join(deckThumbDir, "slide-002.png"), "utf-8")).toBe("deckwright-3");
+// Tracker's local thumbnail cache must be invalidated wholesale after any slide
+// delete. Earlier versions of this code tried to mirror DeckWright's in-place
+// rename file-by-file, but that silently desynced whenever a source file was
+// missing — the destination was left untouched and the cache slowly drifted
+// (root cause of TRACK-290's reported divergence). The new contract: blow the
+// local cache away on every delete; lazy refetch repopulates it.
+describe("invalidateLocalThumbCache", () => {
+  let workDir: string;
+  let cacheDir: string;
+
+  beforeEach(() => {
+    workDir = mkdtempSync(join(tmpdir(), "presentation-test-"));
+    cacheDir = join(workDir, "deck-thumbs", "demo");
+  });
+
+  afterEach(() => {
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("removes every slide-*.png file in the cache directory", () => {
+    mkdirSync(cacheDir, { recursive: true });
+    for (let i = 1; i <= 5; i++) {
+      writeFileSync(join(cacheDir, `slide-${String(i).padStart(3, "0")}.png`), "x");
+    }
+    const removed = invalidateLocalThumbCache(cacheDir);
+    expect(removed).toBe(5);
+    for (let i = 1; i <= 5; i++) {
+      expect(existsSync(join(cacheDir, `slide-${String(i).padStart(3, "0")}.png`))).toBe(false);
+    }
+  });
+
+  it("removes orphan slide files left over from earlier (larger) deck states", () => {
+    mkdirSync(cacheDir, { recursive: true });
+    // Simulate the state described in TRACK-290 — accumulated drift from a
+    // deck that used to have 66 slides, now has fewer. Orphans at the end
+    // must also disappear so they can't surface again on a future fetch.
+    for (let i = 1; i <= 66; i++) {
+      writeFileSync(join(cacheDir, `slide-${String(i).padStart(3, "0")}.png`), "x");
+    }
+    const removed = invalidateLocalThumbCache(cacheDir);
+    expect(removed).toBe(66);
+  });
+
+  it("does not touch unrelated files in the cache directory", () => {
+    mkdirSync(cacheDir, { recursive: true });
+    writeFileSync(join(cacheDir, "slide-001.png"), "x");
+    writeFileSync(join(cacheDir, ".meta.json"), "{}");
+    writeFileSync(join(cacheDir, "thumb-extra.jpg"), "x");
+    const removed = invalidateLocalThumbCache(cacheDir);
+    expect(removed).toBe(1);
+    expect(existsSync(join(cacheDir, ".meta.json"))).toBe(true);
+    expect(existsSync(join(cacheDir, "thumb-extra.jpg"))).toBe(true);
+  });
+
+  it("returns 0 when the cache directory does not exist (cold start)", () => {
+    expect(invalidateLocalThumbCache(join(workDir, "never-existed"))).toBe(0);
+  });
+
+  it("returns 0 when the cache directory exists but is empty", () => {
+    mkdirSync(cacheDir, { recursive: true });
+    expect(invalidateLocalThumbCache(cacheDir)).toBe(0);
   });
 });

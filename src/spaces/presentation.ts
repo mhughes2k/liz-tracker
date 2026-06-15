@@ -14,7 +14,7 @@
  * - Discussion sidebar (always visible)
  */
 
-import { readFileSync, existsSync, mkdirSync, writeFileSync, statSync, unlinkSync, renameSync } from "fs";
+import { readFileSync, existsSync, mkdirSync, writeFileSync, statSync, unlinkSync, renameSync, readdirSync } from "fs";
 import { join } from "path";
 import { updateWorkItem } from "../db.js";
 import { DECKWRIGHT_URL, STORE_DIR } from "../config.js";
@@ -151,23 +151,27 @@ function slideThumbFilename(oneBasedIndex: number): string {
 }
 
 /**
- * Shift thumbnail files after deleting the slide at `deletedIndex`.
+ * Shift thumbnail files in DeckWright's cache after deleting the slide at
+ * `deletedIndex`. Returns true on success (caller should NOT touch mdx mtime —
+ * DeckWright's cache is now coherent with the new mdx). Returns false when the
+ * deckwright cache is missing/stale/mismatched — caller should fall back to
+ * letting DeckWright regenerate.
  *
- * Returns true on success (caller should NOT touch mdx mtime — cache is now
- * coherent with the new mdx). Returns false when the deckwright cache is
- * missing/stale/mismatched — caller should fall back to invalidating the cache
- * by touching mdx mtime so DeckWright re-runs Playwright.
+ * NOTE: This intentionally does NOT touch Tracker's local thumbnail cache.
+ * Tracker's cache is a lazy mirror that must be invalidated wholesale by the
+ * caller (delete all slide-*.png) so the next deck-thumbnails request re-pulls
+ * the freshly-shifted files from DeckWright. Mirroring rename-by-rename here
+ * silently desyncs whenever any source file is missing.
  *
  * Exported for unit testing.
  */
 export function shiftThumbnailsAfterSlideDelete(opts: {
   deckThumbDir: string;     // DeckWright's public/thumbnails/{slug}
-  localThumbDir: string;    // Tracker's STORE_DIR/deck-thumbs/{slug}
   deletedIndex: number;     // 0-based position of the removed slide
   oldSlideCount: number;    // Slide count BEFORE the delete
   newMdxMtimeMs: number;    // mtime of deck.mdx AFTER the write
 }): boolean {
-  const { deckThumbDir, localThumbDir, deletedIndex, oldSlideCount, newMdxMtimeMs } = opts;
+  const { deckThumbDir, deletedIndex, oldSlideCount, newMdxMtimeMs } = opts;
   const metaFile = join(deckThumbDir, ".meta.json");
   if (!existsSync(metaFile)) return false;
 
@@ -186,11 +190,10 @@ export function shiftThumbnailsAfterSlideDelete(opts: {
   const filenames = meta.thumbnails.map(thumbnailFilenameFromUrl);
   const newSlideCount = oldSlideCount - 1;
 
-  // 1. Drop the deleted slide's thumbnail in both caches.
+  // 1. Drop the deleted slide's thumbnail from the DeckWright cache.
   const deletedFilename = filenames[deletedIndex];
   if (deletedFilename) {
     try { unlinkSync(join(deckThumbDir, deletedFilename)); } catch { /* may not exist */ }
-    try { unlinkSync(join(localThumbDir, deletedFilename)); } catch { /* may not exist */ }
   }
 
   // 2. Rename successor thumbnails low → high so we never clobber an upcoming source.
@@ -211,12 +214,6 @@ export function shiftThumbnailsAfterSlideDelete(opts: {
     if (existsSync(fromDeckwright)) {
       try { renameSync(fromDeckwright, toDeckwright); } catch { return false; }
     }
-
-    const fromLocal = join(localThumbDir, sourceFilename);
-    const toLocal = join(localThumbDir, targetFilename);
-    if (existsSync(fromLocal)) {
-      try { renameSync(fromLocal, toLocal); } catch { /* local cache is rebuildable */ }
-    }
   }
 
   // 3. Rewrite .meta.json so DeckWright's cache check passes against the new mdx mtime.
@@ -232,6 +229,37 @@ export function shiftThumbnailsAfterSlideDelete(opts: {
   }
 
   return true;
+}
+
+/**
+ * Invalidate Tracker's local thumbnail cache for a deck by deleting every
+ * slide-*.png file in the cache directory. The next deck-thumbnails request
+ * will re-fetch from DeckWright, picking up the freshly shifted files.
+ *
+ * Best-effort: missing directory or unlink failures are silently swallowed —
+ * the cache exists only to reduce DeckWright load and rebuilds on demand.
+ *
+ * Exported for unit testing.
+ */
+export function invalidateLocalThumbCache(localThumbDir: string): number {
+  if (!existsSync(localThumbDir)) return 0;
+  let removed = 0;
+  let entries: string[];
+  try {
+    entries = readdirSync(localThumbDir);
+  } catch {
+    return 0;
+  }
+  for (const name of entries) {
+    if (!/^slide-\d+\.png$/i.test(name)) continue;
+    try {
+      unlinkSync(join(localThumbDir, name));
+      removed++;
+    } catch {
+      // best-effort
+    }
+  }
+  return removed;
 }
 
 // ── HTTP Helpers ──
@@ -432,7 +460,6 @@ const presentationApiRoutes: SpaceApiRoute[] = [
         const newMtimeMs = statSync(filepath).mtimeMs;
         shifted = shiftThumbnailsAfterSlideDelete({
           deckThumbDir: join(DECKWRIGHT_THUMBS_DIR, spaceData.deck_slug),
-          localThumbDir: join(THUMB_CACHE_DIR, spaceData.deck_slug),
           deletedIndex: index,
           oldSlideCount,
           newMdxMtimeMs: newMtimeMs,
@@ -441,7 +468,19 @@ const presentationApiRoutes: SpaceApiRoute[] = [
         shifted = false;
       }
 
-      jsonResponse(res, { ok: true, remaining: slides.length, deleted_index: index, thumbnails_shifted: shifted });
+      // Always invalidate Tracker's local thumbnail cache. Whether DeckWright's
+      // cache was shifted in-place or will be regenerated, every cached PNG
+      // past `index` now represents the wrong slide. Wiping forces the next
+      // deck-thumbnails request to re-pull from DeckWright.
+      const localInvalidated = invalidateLocalThumbCache(join(THUMB_CACHE_DIR, spaceData.deck_slug));
+
+      jsonResponse(res, {
+        ok: true,
+        remaining: slides.length,
+        deleted_index: index,
+        thumbnails_shifted: shifted,
+        local_thumbs_invalidated: localInvalidated,
+      });
     },
   },
   // GET /items/:id/presentation/deck-thumb — serve a cached thumbnail image
