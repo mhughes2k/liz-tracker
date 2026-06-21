@@ -435,7 +435,8 @@ Uses [OpenCode](https://opencode.ai) as the session manager.
 | `CODER_EFFORT` | `high` | Default reasoning effort (`low`/`medium`/`high`/`max`) |
 | `CIRCUIT_BREAKER_THRESHOLD` | `2` | Consecutive failures before auto-pause |
 | `CIRCUIT_BREAKER_WINDOW` | `3600000` | Failure counting window (ms, default 1 hour) |
-| `ITEM_DISPATCH_FAILURE_LIMIT` | `3` | Per-item failures before auto-shelving |
+| `ITEM_DISPATCH_FAILURE_LIMIT` | `3` | Per-item dispatch *errors* before auto-shelving to `needs_input` |
+| `ITEM_NO_PROGRESS_LIMIT` | `5` | Per-item *no-progress* completions (session "succeeded" but item never advanced) before auto-shelving to `needs_input` |
 
 All model/effort defaults above can be overridden at runtime via the dashboard's **Settings** dialog (topbar gear icon). Stored overrides live in the `tracker_settings` DB table and take precedence over env-var defaults.
 
@@ -444,7 +445,7 @@ All model/effort defaults above can be overridden at runtime via the dashboard's
 - **Actor classification** — only human actors can approve items for execution
 - **Description integrity** — SHA-256 hash verified at dispatch to detect tampering
 - **Circuit breaker** — auto-pauses after consecutive failures
-- **Per-item retry limit** — auto-shelves items that fail repeatedly
+- **Per-item retry limit** — auto-shelves items that fail repeatedly (errors *or* successful sessions with no forward progress)
 - **Emergency stop** — dashboard button to pause orchestrator and cancel all sessions
 - **Safe restart** — waits for active sessions to complete before restarting
 - **Blocked file patterns** — prevents AI agents from modifying security-critical files
