@@ -58,6 +58,7 @@ import {
   CIRCUIT_BREAKER_THRESHOLD,
   CIRCUIT_BREAKER_WINDOW,
   ITEM_DISPATCH_FAILURE_LIMIT,
+  ITEM_NO_PROGRESS_LIMIT,
   STORE_DIR,
   CODER_MODEL_PROVIDER,
   CODER_MODEL_ID,
@@ -685,6 +686,12 @@ let circuitBroken = false;
 // After ITEM_DISPATCH_FAILURE_LIMIT failures, the item is auto-moved to needs_input.
 // Cleared when an item completes successfully or its state is changed externally.
 const itemDispatchFailures = new Map<string, number>();
+
+// Per-item counter of consecutive "no-progress" session completions. Distinct
+// from itemDispatchFailures (which counts SDK/dispatch *errors*): a no-progress
+// completion is a session the SDK reported as successful that nonetheless left
+// the item in a still-dispatchable state. See recordNoProgressCompletion().
+const itemNoProgressCompletions = new Map<string, number>();
 
 // Safe restart state
 interface RestartRequest {
@@ -3876,7 +3883,9 @@ function handleSessionComplete(sessionId: string): void {
 
   // Auto-advance based on final item state
   if (item.state === "in_review") {
-    // Expected flow: agent moved to in_review, orchestrator advances to testing
+    // Expected flow: agent moved to in_review, orchestrator advances to testing.
+    // The agent made real progress — reset the no-progress loop counter.
+    clearNoProgressCompletions(session.itemId);
     changeWorkItemState(
       session.itemId,
       "testing",
@@ -3890,6 +3899,7 @@ function handleSessionComplete(sessionId: string): void {
   } else if (item.state === "done") {
     // Agent moved directly to done, bypassing the testing phase.
     // Revert to testing so the owner gets a chance to verify.
+    clearNoProgressCompletions(session.itemId);
     changeWorkItemState(
       session.itemId,
       "testing",
@@ -3901,8 +3911,10 @@ function handleSessionComplete(sessionId: string): void {
       "Session completed — agent moved directly to done, reverted to testing for owner verification",
     );
   } else if (item.state === "in_development") {
-    // Agent didn't move the item at all — session may have ended prematurely.
+    // Agent didn't move the item past in_development — but it DID start work
+    // (broke out of approved), so this counts as progress: reset the counter.
     // The safety net above already unlocked. Add a comment noting the incomplete session.
+    clearNoProgressCompletions(session.itemId);
     createComment({
       work_item_id: session.itemId,
       author: "orchestrator",
@@ -3918,7 +3930,16 @@ function handleSessionComplete(sessionId: string): void {
       { itemId: session.itemId, sessionId },
       "Session completed but item still in_development — moved to in_review",
     );
+  } else if (isNoProgressState(item.state)) {
+    // No-progress completion: the session "succeeded" but left the item in a
+    // still-dispatchable state, so tryDispatch() below would re-dispatch it and
+    // loop. Count it; after ITEM_NO_PROGRESS_LIMIT consecutive no-progress
+    // completions recordNoProgressCompletion() shelves the item to needs_input.
+    recordNoProgressCompletion(session.itemId, item.state);
   } else {
+    // Some other non-dispatchable state (e.g. needs_input, cancelled, testing) —
+    // not a loop risk. Clear any stale no-progress count and log.
+    clearNoProgressCompletions(session.itemId);
     logger.info(
       { itemId: session.itemId, sessionId, state: item.state },
       "Session completed — item in unexpected state, no auto-advance",
@@ -4182,6 +4203,99 @@ function clearItemDispatchFailures(itemId: string): void {
   if (itemDispatchFailures.has(itemId)) {
     itemDispatchFailures.delete(itemId);
     logger.debug({ itemId }, "Cleared per-item dispatch failure counter (success)");
+  }
+}
+
+// ── No-Progress Completion Guard (loop protection) ──
+//
+// A session can be reported by the SDK as a *successful* completion yet make no
+// forward progress: the agent emits some output but never moves the item out of
+// its dispatchable state. The classic trigger is an auth (401) failure where every
+// session ends in one turn with only an error message. Because the item is still
+// `approved` (or `clarification`), tryDispatch() immediately re-dispatches it —
+// an infinite loop that the error-based ITEM_DISPATCH_FAILURE_LIMIT never catches
+// (no SDK error fired, so recordItemDispatchFailure() is never called; worse, the
+// success path clears that counter every cycle). This guard counts consecutive
+// no-progress completions and shelves the item to needs_input at the limit.
+// Why: prevent a single broken item from looping forever (e.g. thousands of
+//   execution-audit rows from a 401 storm).
+// Safety: only counts states that would actually re-dispatch; shelving uses the
+//   same human-reviewable needs_input destination as the failure path, and the
+//   counter resets on real progress or human re-approval. No approval provenance
+//   is touched.
+
+/**
+ * Whether a completed session left the item in a state the dispatcher will pick
+ * up again — i.e. the session made no progress and will re-loop. These are the
+ * coder (`approved`) and research (`clarification`) entry states.
+ */
+export function isNoProgressState(state: string): boolean {
+  return state === "approved" || state === "clarification";
+}
+
+/**
+ * Pure decision helper: given the current consecutive no-progress count and the
+ * limit, return the incremented count and whether the item should now be shelved.
+ * Extracted so the loop-cap logic is unit-testable without DB/module state.
+ */
+export function evaluateNoProgress(
+  currentCount: number,
+  limit: number,
+): { count: number; shouldShelve: boolean } {
+  const count = currentCount + 1;
+  return { count, shouldShelve: count >= limit };
+}
+
+/**
+ * Record a no-progress completion for an item. After ITEM_NO_PROGRESS_LIMIT
+ * consecutive no-progress completions, auto-move the item to needs_input so it
+ * stops being dispatched. Returns true if the item was shelved.
+ */
+function recordNoProgressCompletion(itemId: string, state: string): boolean {
+  const { count, shouldShelve } = evaluateNoProgress(
+    itemNoProgressCompletions.get(itemId) || 0,
+    ITEM_NO_PROGRESS_LIMIT,
+  );
+  itemNoProgressCompletions.set(itemId, count);
+
+  logger.warn(
+    { itemId, state, noProgressCount: count, limit: ITEM_NO_PROGRESS_LIMIT },
+    "Session completed without progress — item still dispatchable",
+  );
+
+  if (shouldShelve) {
+    itemNoProgressCompletions.delete(itemId);
+    const item = getWorkItem(itemId);
+    if (item && item.state !== "needs_input" && item.state !== "done" && item.state !== "cancelled") {
+      createComment({
+        work_item_id: itemId,
+        author: "orchestrator",
+        body: `Auto-moved to needs_input: ${count} consecutive sessions completed without making any progress (the item never moved out of \`${state}\`). This usually means the agent could not start — e.g. an authentication failure or a broken environment. The orchestrator will not retry until the item is moved back to approved.`,
+      });
+      changeWorkItemState(
+        itemId,
+        "needs_input",
+        "orchestrator",
+        `Auto-shelved after ${count} no-progress sessions`,
+      );
+      logger.warn(
+        { itemId, noProgressCount: count, limit: ITEM_NO_PROGRESS_LIMIT },
+        "No-progress retry limit reached — moved to needs_input",
+      );
+    }
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Clear the no-progress counter for an item. Called when the item makes real
+ * progress (advances state) or is re-approved by a human.
+ */
+function clearNoProgressCompletions(itemId: string): void {
+  if (itemNoProgressCompletions.has(itemId)) {
+    itemNoProgressCompletions.delete(itemId);
+    logger.debug({ itemId }, "Cleared no-progress completion counter (progress made)");
   }
 }
 
@@ -4514,6 +4628,9 @@ function startApprovalWatcher(): void {
     // This allows retry after the underlying issue has been fixed.
     if (event.work_item_id) {
       clearItemDispatchFailures(event.work_item_id);
+      // Also reset the no-progress loop counter so a re-approved item gets a
+      // fresh set of attempts after the root cause (e.g. auth) is fixed.
+      clearNoProgressCompletions(event.work_item_id);
     }
 
     logger.info(

@@ -156,7 +156,8 @@ All configuration is via `.env` file or environment variables. See `.env.example
 | `TRACKER_API_TOKEN` | (auto-generated) | Bearer token for write API endpoints |
 | `CIRCUIT_BREAKER_THRESHOLD` | `2` | Consecutive failures before auto-pause |
 | `CIRCUIT_BREAKER_WINDOW` | `3600000` | Window (ms) for counting failures (1 hour) |
-| `ITEM_DISPATCH_FAILURE_LIMIT` | `3` | Per-item failures before auto-shelving to needs_input |
+| `ITEM_DISPATCH_FAILURE_LIMIT` | `3` | Per-item dispatch *errors* before auto-shelving to needs_input |
+| `ITEM_NO_PROGRESS_LIMIT` | `5` | Per-item *no-progress* completions (session "succeeded" but item never left its dispatchable state) before auto-shelving to needs_input |
 | `ANTHROPIC_API_KEY` | (none) | Anthropic API key — enables AI categorization button in the dashboard |
 | `AI_CATEGORIZE_MODEL` | `claude-haiku-4-5-20251001` | Model for AI categorization (fast structured extraction) |
 | `WEBHOOK_URL` | (none) | URL to POST webhook notifications to (comments + scheduled task triggers) |
@@ -326,6 +327,10 @@ Note: Image-too-large errors (e.g. oversized attachments) count toward the circu
 #### Per-item retry limit
 
 If a single work item fails dispatch `ITEM_DISPATCH_FAILURE_LIMIT` times (default: 3), the orchestrator auto-moves it to `needs_input` and stops retrying. This prevents a single broken item (e.g. oversized attachment) from looping indefinitely. The counter resets when the item is re-approved (e.g. after fixing the underlying issue).
+
+#### Per-item no-progress limit
+
+The error-based limit above only catches sessions that throw. A session can also be reported by the SDK as a **successful** completion yet make no forward progress — the agent emits output but never moves the item out of its dispatchable state (`approved` or `clarification`). The classic trigger is an authentication (401) failure where every session ends in one turn with only an error message; because the item is still `approved`, the orchestrator re-dispatches it forever (the error counter never fires, and the success path clears it each cycle). To cap this, `recordNoProgressCompletion()` counts consecutive no-progress completions and auto-moves the item to `needs_input` after `ITEM_NO_PROGRESS_LIMIT` (default: 5). The counter resets when the item makes real progress (advances to `in_development`/`in_review`/`done`) or is re-approved by a human. Pure helpers `isNoProgressState()` and `evaluateNoProgress()` carry the testable decision logic (see `src/orchestrator.test.ts`).
 
 #### Emergency stop
 

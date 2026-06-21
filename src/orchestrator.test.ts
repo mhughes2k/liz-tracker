@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { isProcessAlive, resolveOpencodePid, sendSignal, killProcessGracefully, validateAgentConfig, is413Error, isImageTooLargeError, isPostCompletionError, isScheduleTimeDue, buildPromptParts, buildResearchPromptParts, resolveModelForItem } from "./orchestrator.js";
+import { isProcessAlive, resolveOpencodePid, sendSignal, killProcessGracefully, validateAgentConfig, is413Error, isImageTooLargeError, isPostCompletionError, isScheduleTimeDue, buildPromptParts, buildResearchPromptParts, resolveModelForItem, isNoProgressState, evaluateNoProgress } from "./orchestrator.js";
 import { base64UrlEncode, buildOpencodeSessionUrl, buildOpencodeDirectoryUrl, buildOpencodeApiSessionUrl, DISPATCH_MODE } from "./config.js";
 import fs from "fs";
 import path from "path";
@@ -1101,5 +1101,64 @@ describe("resolveModelForItem", () => {
       expect(result.modelId).toBe("claude-sonnet-4-6");
       expect(result.effort).toBe("low");
     });
+  });
+});
+
+// ── No-progress completion guard (loop protection) ──────────────────────────
+
+describe("isNoProgressState", () => {
+  it("flags states a completed session can re-dispatch from (loop risk)", () => {
+    // These are the states getDispatchableItems() will pick up again, so a
+    // session that completes leaving the item here will loop forever.
+    expect(isNoProgressState("approved")).toBe(true);
+    expect(isNoProgressState("clarification")).toBe(true);
+  });
+
+  it("does not flag states that represent real progress or a stopped item", () => {
+    for (const s of [
+      "in_development",
+      "in_review",
+      "testing",
+      "done",
+      "needs_input",
+      "brainstorming",
+      "cancelled",
+    ]) {
+      expect(isNoProgressState(s)).toBe(false);
+    }
+  });
+});
+
+describe("evaluateNoProgress", () => {
+  it("increments the count by one each call", () => {
+    expect(evaluateNoProgress(0, 5).count).toBe(1);
+    expect(evaluateNoProgress(3, 5).count).toBe(4);
+  });
+
+  it("does not shelve before the limit is reached", () => {
+    expect(evaluateNoProgress(0, 5).shouldShelve).toBe(false);
+    expect(evaluateNoProgress(3, 5).shouldShelve).toBe(false); // becomes 4 < 5
+  });
+
+  it("shelves exactly when the count reaches the limit", () => {
+    expect(evaluateNoProgress(4, 5).shouldShelve).toBe(true); // becomes 5 >= 5
+  });
+
+  it("shelves when the count exceeds the limit (defensive)", () => {
+    expect(evaluateNoProgress(9, 5).shouldShelve).toBe(true);
+  });
+
+  it("caps the loop at the configured number of tries (5 by default)", () => {
+    // Simulate consecutive no-progress completions; the item must be shelved
+    // by the 5th attempt and never reach a 6th dispatch.
+    const limit = 5;
+    let count = 0;
+    let shelvedAt = 0;
+    for (let attempt = 1; attempt <= 10 && shelvedAt === 0; attempt++) {
+      const r = evaluateNoProgress(count, limit);
+      count = r.count;
+      if (r.shouldShelve) shelvedAt = attempt;
+    }
+    expect(shelvedAt).toBe(5);
   });
 });

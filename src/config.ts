@@ -388,6 +388,22 @@ export const ITEM_DISPATCH_FAILURE_LIMIT = parseInt(
   10,
 );
 
+/**
+ * Maximum number of consecutive "no-progress" session completions allowed for a
+ * single work item before the orchestrator auto-moves it to needs_input.
+ *
+ * A no-progress completion is a session that the SDK reports as *successful* but
+ * which left the item in a still-dispatchable state (e.g. `approved`) — the agent
+ * produced output but never moved the item forward. Without this guard such
+ * sessions are re-dispatched forever (the error-based ITEM_DISPATCH_FAILURE_LIMIT
+ * never triggers because no SDK error fired). This was hit by an auth (401) failure
+ * mode where every session emitted only an error message and ended in 1 turn.
+ */
+export const ITEM_NO_PROGRESS_LIMIT = parseInt(
+  process.env.ITEM_NO_PROGRESS_LIMIT || "5",
+  10,
+);
+
 // ── DeckWright config ──
 
 /**
